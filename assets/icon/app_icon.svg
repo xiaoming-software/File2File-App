@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Source lettermark reference. Production assets: app_icon.png / app_icon_foreground.png -->
+  <rect width="1024" height="1024" fill="#0B6E4F"/>
+  <text x="512" y="560" text-anchor="middle" font-family="Avenir Next, Helvetica Neue, Helvetica, Arial, sans-serif" font-size="320" font-weight="700" fill="#FFFFFF" letter-spacing="-8">F2F</text>
+</svg>

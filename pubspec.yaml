@@ -1,0 +1,61 @@
+name: file2file
+description: "File2File mobile — P2P chat and personal drive over webrpc."
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: ^3.13.4
+
+dependencies:
+  flutter:
+    sdk: flutter
+  cupertino_icons: ^1.0.8
+  ffi: ^2.1.4
+  http: ^1.5.0
+  path: ^1.9.1
+  path_provider: ^2.1.5
+  shared_preferences: ^2.5.3
+  flutter_secure_storage: ^11.2.0
+  provider: ^6.1.5
+  intl: ^0.20.2
+  uuid: ^4.5.1
+  file_picker: ^13.1.0
+  image_picker: ^1.1.2
+  permission_handler: ^11.4.0
+  gal: ^2.3.1
+  open_filex: ^4.7.0
+  opus_dart: ^3.0.1
+  opus_flutter: ^3.0.3
+  record: ^7.1.1
+  flutter_pcm_sound: ^3.3.3
+  video_player: ^2.14.0
+  url_launcher: ^6.3.2
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+
+# Vendored Android plugins with compileSdk 36 (upstream pins 33).
+dependency_overrides:
+  flutter_pcm_sound:
+    path: third_party/flutter_pcm_sound
+  opus_flutter_android:
+    path: third_party/opus_flutter_android
+
+flutter_launcher_icons:
+  android: true
+  ios: true
+  image_path: assets/icon/app_icon.png
+  adaptive_icon_background: "#0B6E4F"
+  adaptive_icon_foreground: assets/icon/app_icon_foreground.png
+  adaptive_icon_monochrome: assets/icon/app_icon_foreground.png
+  remove_alpha_ios: true
+  background_color_ios: "#0B6E4F"
+  min_sdk_android: 24
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/icon/app_icon.png
