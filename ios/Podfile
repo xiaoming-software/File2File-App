@@ -4,6 +4,23 @@ platform :ios, '15.0'
 # CocoaPods analytics sends network stats synchronously affecting flutter build latency.
 ENV['COCOAPODS_DISABLE_STATS'] = 'true'
 
+# Official cdn.cocoapods.org often times out or returns 403 in some networks.
+# jsDelivr mirrors the same CDN layout (CocoaPods-version.yml).
+source 'https://cdn.jsdelivr.net/cocoa/'
+
+# Avoid Net::OpenTimeout while CocoaPods probes the specs CDN.
+require 'net/http'
+module Net
+  class HTTP
+    alias_method :file2file_initialize, :initialize
+    def initialize(*args)
+      file2file_initialize(*args)
+      self.open_timeout = 60
+      self.read_timeout = 60
+    end
+  end
+end
+
 project 'Runner', {
   'Debug' => :debug,
   'Profile' => :release,

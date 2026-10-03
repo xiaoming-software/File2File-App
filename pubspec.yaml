@@ -43,6 +43,8 @@ dependency_overrides:
     path: third_party/flutter_pcm_sound
   opus_flutter_android:
     path: third_party/opus_flutter_android
+  opus_flutter_ios:
+    path: third_party/opus_flutter_ios
 
 flutter_launcher_icons:
   android: true

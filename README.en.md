@@ -147,6 +147,22 @@ flutter run -d emulator-5554
 
 > The webrpc Android library currently ships **arm64-v8a** only. Use an arm64 emulator or arm64 device — not an x86 system image.
 
+### iOS Simulator (one-shot)
+
+Requires macOS, Xcode, and an installed iOS Simulator runtime. Defaults to **iPhone 15**:
+
+```bash
+./tool/run_ios_simulator.sh
+```
+
+Pick another model (must match `xcrun simctl list devices available`):
+
+```bash
+IOS_SIMULATOR="iPhone 15 Pro" ./tool/run_ios_simulator.sh
+```
+
+> `webrpc-sdk/libwebrpc-ios.a` is for physical devices. The Simulator uses `libwebrpc-ios-simulator.a` (Apple Silicon arm64). Intel simulators are not covered.
+
 ### Common commands
 
 ```bash
@@ -157,6 +173,18 @@ flutter build ios    # iOS (macOS + Xcode signing required)
 ```
 
 Native webrpc bits live under `webrpc-sdk/`. On Android, `libwebrpc.so` is under `android/app/src/main/jniLibs/arm64-v8a/`.
+
+### Publish the Android APK (GitHub Release)
+
+Set `VERSION_NAME` at the top of the script, then:
+
+```bash
+./tool/release_android.sh
+```
+
+The script generates a local upload keystore on first run, sets `versionCode` from a timestamp, builds a release APK, pushes tag `v<version>`, and publishes it as the Latest GitHub Release.
+
+Keep `android/keystore/upload.jks` and `android/key.properties` backed up (they are gitignored). Losing or rotating the key means users cannot upgrade over the old app.
 
 ---
 

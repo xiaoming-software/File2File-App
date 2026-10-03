@@ -623,12 +623,11 @@ packages:
     source: path
     version: "3.0.1"
   opus_flutter_ios:
-    dependency: transitive
+    dependency: "direct overridden"
     description:
-      name: opus_flutter_ios
-      sha256: c999bbe8b8f1a4073fb62de6cc04ecd3ab3acdefa6b8d78b03c0dac9c81ef0fa
-      url: "https://pub.dev"
-    source: hosted
+      path: "third_party/opus_flutter_ios"
+      relative: true
+    source: path
     version: "3.0.1"
   opus_flutter_platform_interface:
     dependency: transitive

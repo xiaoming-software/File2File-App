@@ -147,6 +147,22 @@ flutter run -d emulator-5554
 
 > webrpc Android 库目前仅提供 **arm64-v8a**。请使用 arm64 模拟器或 arm64 真机，不要使用 x86 系统镜像。
 
+### iOS 模拟器一键运行
+
+需要 macOS、Xcode，以及已安装的 iOS Simulator runtime。默认启动 **iPhone 15**：
+
+```bash
+./tool/run_ios_simulator.sh
+```
+
+指定其他机型（名称需与 `xcrun simctl list devices available` 一致）：
+
+```bash
+IOS_SIMULATOR="iPhone 15 Pro" ./tool/run_ios_simulator.sh
+```
+
+> 当前 `webrpc-sdk/libwebrpc-ios.a` 用于真机；模拟器使用 `libwebrpc-ios-simulator.a`（Apple Silicon arm64）。Intel 模拟器未覆盖。
+
 ### 通用构建
 
 ```bash
@@ -157,6 +173,18 @@ flutter build ios    # iOS（需在 macOS + Xcode 完成签名）
 ```
 
 原生 webrpc 库位于工程内 `webrpc-sdk/`；Android 侧 `libwebrpc.so` 已放入 `android/app/src/main/jniLibs/arm64-v8a/`。
+
+### 发布 Android 安装包（GitHub Release）
+
+改脚本顶部的 `VERSION_NAME` 后执行：
+
+```bash
+./tool/release_android.sh
+```
+
+脚本会：生成本机固定签名（首次）→ 用时间戳生成 `versionCode` → `flutter build apk --release` → 打 `v主版本号` tag 并推送 → 作为 Latest Release 上传 APK。
+
+签名文件在 `android/keystore/upload.jks` 与 `android/key.properties`，已加入 `.gitignore`。请自行备份；丢失或更换密钥后，用户无法覆盖安装旧版。
 
 ---
 

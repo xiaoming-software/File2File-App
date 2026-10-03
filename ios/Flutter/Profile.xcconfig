@@ -1,5 +1,6 @@
 #include? "Pods/Target Support Files/Pods-Runner/Pods-Runner.profile.xcconfig"
 #include "Generated.xcconfig"
 
-OTHER_LDFLAGS=$(inherited) -force_load $(PROJECT_DIR)/../webrpc-sdk/libwebrpc-ios.a -lresolv -framework Security -framework CoreFoundation -framework SystemConfiguration
 LIBRARY_SEARCH_PATHS=$(inherited) $(PROJECT_DIR)/../webrpc-sdk
+OTHER_LDFLAGS[sdk=iphoneos*]=$(inherited) -force_load $(PROJECT_DIR)/../webrpc-sdk/libwebrpc-ios.a -lresolv -framework Security -framework CoreFoundation -framework SystemConfiguration
+OTHER_LDFLAGS[sdk=iphonesimulator*]=$(inherited) -force_load $(PROJECT_DIR)/../webrpc-sdk/libwebrpc-ios-simulator.a -lresolv -framework Security -framework CoreFoundation -framework SystemConfiguration
