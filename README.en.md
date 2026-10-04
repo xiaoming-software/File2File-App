@@ -54,9 +54,17 @@ For Windows / macOS / Linux, use the desktop client:
 - Transfer progress and retry; save received media to the album or download locally
 - Interoperable with [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop/tree/main) over the same webrpc session and message protocol
 
+<img src="img/file2windows.png" alt="Sending a photo from the app to a computer" width="280">
+
+*Send a photo from the phone to a computer. Progress, speed, and “sent” status show in the session.*
+
 ### Personal NAS / drive
 
 After connecting to a self-hosted [`mywebdisk-server`](https://github.com/xiaoming-software/mywebdisk):
+
+<img src="img/mywebdisk.png" alt="Drive session list" width="280">
+
+*Drive tab: connected personal NAS sessions and “New drive”.*
 
 | Capability | Description |
 | --- | --- |
@@ -65,6 +73,10 @@ After connecting to a self-hosted [`mywebdisk-server`](https://github.com/xiaomi
 | Preview | Editable text save; images; progressive audio/video playback |
 | Organize | Create folders, rename, move, delete, multi-select batch actions |
 | Search | Full-drive filename search |
+
+<img src="img/mywebdisk-data.png" alt="Browsing a personal NAS folder in the app" width="280">
+
+*Inside a drive: capacity, search, folders, and files in one list.*
 
 Files remain under the directory you configure on the server; reads and writes use an encrypted webrpc P2P channel.
 
@@ -89,7 +101,7 @@ Both peers (or the NAS server) need a [webrpc](https://www.webrpc.cn/) **Token**
 
 ### 1. Sign in on mobile
 
-1. Build and install the app from this repository (see below).
+1. Install the app: Android APKs are on [GitHub Releases](https://github.com/xiaoming-software/File2File-App/releases), or build from source below. iOS requires a source build and signing on macOS.
 2. Sign in with a [webrpc](https://www.webrpc.cn/) Token and password, and set a **passphrase** (required; peers need it to connect to you).
 3. Optionally remember the account for the next launch.
 
@@ -114,7 +126,7 @@ Server flags and prebuilt binaries: [mywebdisk repository](https://github.com/xi
 
 ## Build from source
 
-Source builds are the supported distribution path for now. There is no app-store package or standalone release binary yet.
+Android release APKs are published on [GitHub Releases](https://github.com/xiaoming-software/File2File-App/releases) (arm64). iOS is not sideloaded from GitHub; build and sign on macOS. For development, use the scripts below.
 
 ### Requirements
 

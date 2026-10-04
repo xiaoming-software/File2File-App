@@ -54,9 +54,17 @@ P2P 直连 · 默认加密 · 无需公网 IP · 基于 [webrpc](https://www.web
 - 传输进度、失败重试；接收文件可下载或保存到相册
 - 与 [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop/tree/main) 使用同一套 webrpc 会话与消息协议，可互通
 
+<img src="img/file2windows.png" alt="用 App 把图片传到电脑" width="280">
+
+*手机连上电脑后发送图片：进度、速率与「发送成功」会显示在会话里。*
+
 ### 个人网盘 / NAS
 
 连接自建的 [`mywebdisk-server`](https://github.com/xiaoming-software/mywebdisk) 后，可在手机上：
+
+<img src="img/mywebdisk.png" alt="网盘会话列表" width="280">
+
+*「网盘」页：已连接的个人网盘会话，以及「新建网盘」。*
 
 | 能力 | 说明 |
 | --- | --- |
@@ -65,6 +73,10 @@ P2P 直连 · 默认加密 · 无需公网 IP · 基于 [webrpc](https://www.web
 | 预览 | 文本编辑保存；图片；音视频边下边播 |
 | 整理 | 新建文件夹、重命名、移动、删除、多选批量操作 |
 | 搜索 | 全盘按文件名搜索 |
+
+<img src="img/mywebdisk-data.png" alt="在 App 里浏览个人网盘目录" width="280">
+
+*进入网盘后浏览目录：容量、搜索、文件夹与各类文件一目了然。*
 
 数据保留在你指定的服务器目录中，读写走 webrpc 加密 P2P 通道。
 
@@ -89,7 +101,7 @@ P2P 直连 · 默认加密 · 无需公网 IP · 基于 [webrpc](https://www.web
 
 ### 1. 登录手机端
 
-1. 从本仓库源码构建并安装 App（见下文）。
+1. 安装 App：Android 可从 [GitHub Releases](https://github.com/xiaoming-software/File2File-App/releases) 下载 APK，或按下文从源码构建；iOS 需在 macOS 上从源码构建并签名。
 2. 使用 [webrpc](https://www.webrpc.cn/) Token 与密码登录，并设置 **认证口令**（必填，对方连接你时需要）。
 3. 可勾选记住账号，方便下次自动登录。
 
@@ -114,7 +126,7 @@ P2P 直连 · 默认加密 · 无需公网 IP · 基于 [webrpc](https://www.web
 
 ## 从源码构建与运行
 
-当前以源码构建为主，暂不提供应用商店或独立预编译安装包。
+Android 正式 APK 发布在 [GitHub Releases](https://github.com/xiaoming-software/File2File-App/releases)（arm64）。iOS 暂不提供商店或侧载包，需在 macOS 上从源码构建。开发调试仍建议用下面的脚本。
 
 ### 环境要求
 
