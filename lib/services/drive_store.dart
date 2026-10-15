@@ -31,6 +31,28 @@ class DriveStore {
     return p.join(dir.path, safeFileName(fileName));
   }
 
+  Future<Directory> thumbDir(String owner, String peer) async {
+    final root = await _root();
+    final dir = Directory(p.join(root.path, 'thumbs', _safe(owner), _safe(peer)));
+    if (!await dir.exists()) await dir.create(recursive: true);
+    return dir;
+  }
+
+  /// Stable local cache path for a remote file thumbnail.
+  Future<String> thumbPath(
+    String owner,
+    String peer,
+    String remoteDir,
+    String fileName, {
+    int edge = 192,
+  }) async {
+    final dir = await thumbDir(owner, peer);
+    final key = '${normalizeNasPath(remoteDir)}|$fileName|$edge'
+        .replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
+    final short = key.length > 120 ? key.substring(0, 120) : key;
+    return p.join(dir.path, '$short.jpg');
+  }
+
   Future<List<DriveSession>> load(String owner) async {
     final file = await _listFile(owner);
     if (!await file.exists()) return [];
@@ -54,11 +76,13 @@ class DriveStore {
 
   Future<void> deleteDriveData(String owner, String peer) async {
     final root = await _root();
-    final dir = Directory(p.join(root.path, 'files', _safe(owner), _safe(peer)));
-    if (await dir.exists()) {
-      try {
-        await dir.delete(recursive: true);
-      } catch (_) {}
+    for (final sub in ['files', 'thumbs']) {
+      final dir = Directory(p.join(root.path, sub, _safe(owner), _safe(peer)));
+      if (await dir.exists()) {
+        try {
+          await dir.delete(recursive: true);
+        } catch (_) {}
+      }
     }
   }
 

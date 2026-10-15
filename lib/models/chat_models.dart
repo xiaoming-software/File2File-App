@@ -21,12 +21,35 @@ ChatMsgKind classifyFileName(String name) {
       lower.endsWith('.heic')) {
     return ChatMsgKind.image;
   }
-  if (lower.endsWith('.mp4') ||
-      lower.endsWith('.mov') ||
-      lower.endsWith('.mkv') ||
-      lower.endsWith('.webm') ||
-      lower.endsWith('.avi')) {
-    return ChatMsgKind.video;
+  const videoExts = {
+    '.mp4',
+    '.m4v',
+    '.mov',
+    '.qt',
+    '.mkv',
+    '.webm',
+    '.avi',
+    '.wmv',
+    '.asf',
+    '.flv',
+    '.f4v',
+    '.3gp',
+    '.3g2',
+    '.ts',
+    '.m2ts',
+    '.mts',
+    '.mpeg',
+    '.mpg',
+    '.mpe',
+    '.vob',
+    '.ogv',
+    '.rm',
+    '.rmvb',
+    '.divx',
+    '.xvid',
+  };
+  for (final e in videoExts) {
+    if (lower.endsWith(e)) return ChatMsgKind.video;
   }
   if (lower.endsWith('.mp3') ||
       lower.endsWith('.m4a') ||

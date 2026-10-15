@@ -85,19 +85,30 @@ class VoiceController extends ChangeNotifier {
 
   bool get isBusy => _state.phase != VoicePhase.idle;
 
-  /// Secondary OpenSession hello (voice) must not rebind the chat session.
+  /// True only for sessions already known to be voice/media transports.
+  /// Do NOT treat every second OpenSession from the same peer as voice — that
+  /// broke chat when Desktop also OpenSession'd to the App (messages dropped).
   bool shouldSkipChatHello(int rpcId, String peerToken) {
+    if (rpcId == 0) return false;
     if (_knownMediaSessions.contains(rpcId)) return true;
     if (_state.voiceRpcId != 0 && _state.voiceRpcId == rpcId) return true;
-    final existing = _chat.sessionByPeer(peerToken);
-    if (existing != null &&
-        existing.connected &&
-        existing.rpcSessionId != 0 &&
-        existing.rpcSessionId != rpcId) {
+    // While a call is active/setting up, a new OpenSession from the same peer
+    // that we did not yet mark is still likely media (callee side before type11).
+    if (isBusy &&
+        peerToken.isNotEmpty &&
+        peerToken == _state.peerToken &&
+        _state.chatRpcId != 0 &&
+        rpcId != _state.chatRpcId) {
       _knownMediaSessions.add(rpcId);
       return true;
     }
     return false;
+  }
+
+  bool isMediaRpc(int rpcId) {
+    if (rpcId == 0) return false;
+    return _knownMediaSessions.contains(rpcId) ||
+        (_state.voiceRpcId != 0 && _state.voiceRpcId == rpcId);
   }
 
   void onInboundSecondarySession(int rpcId, ChatSession chatSession) {

@@ -1,6 +1,6 @@
 import 'dart:convert';
 
-import '../models/chat_models.dart' show ChatMsgKind, classifyFileName;
+import '../models/chat_models.dart' show ChatMsgKind, classifyFileName, safeFileName;
 
 export 'chat_models.dart' show ChatMsgKind, classifyFileName, safeFileName;
 
@@ -74,10 +74,8 @@ class NasEntry {
 
   factory NasEntry.fromPathItem(String name, Map<String, dynamic> item) {
     final ifFile = item['ifFile'] == true || item['ifFile'] == 1;
-    final sizeRaw = item['size'];
-    final size = sizeRaw is num ? sizeRaw.toInt() : 0;
-    final lastRaw = item['lastDate'];
-    final last = lastRaw is num ? lastRaw.toInt() : 0;
+    final size = _parseIntField(item['size']);
+    final last = _parseIntField(item['lastDate']);
     return NasEntry(
       name: name,
       isDir: !ifFile,
@@ -85,6 +83,12 @@ class NasEntry {
       lastDateMs: last,
     );
   }
+}
+
+int _parseIntField(dynamic raw) {
+  if (raw is num) return raw.toInt();
+  if (raw is String) return int.tryParse(raw.trim()) ?? 0;
+  return 0;
 }
 
 class NasInfo {
@@ -122,7 +126,7 @@ class NasSearchHit {
 
 enum DriveTransferKind { download, upload }
 
-enum DriveTransferStatus { queued, running, done, failed }
+enum DriveTransferStatus { queued, running, done, failed, cancelled }
 
 class DriveTransfer {
   DriveTransfer({
@@ -137,6 +141,7 @@ class DriveTransfer {
     this.error = '',
     this.startedAt,
     this.speedBps = 0,
+    this.cancelableByPreview = false,
   });
 
   final String id;
@@ -150,6 +155,12 @@ class DriveTransfer {
   String error;
   DateTime? startedAt;
   int speedBps;
+
+  /// Preview-created download; may be cancelled when preview closes.
+  bool cancelableByPreview;
+
+  /// Soft-cancel while running (chunk loop / waiter check this).
+  bool cancelRequested = false;
 
   double get progress {
     if (size <= 0) return status == DriveTransferStatus.done ? 1 : 0;
@@ -198,6 +209,18 @@ class DriveSession {
           t.status == DriveTransferStatus.queued ||
           t.status == DriveTransferStatus.running)
       .length;
+
+  DriveTransfer? findDownload(String remoteDir, String name) {
+    final dir = normalizeNasPath(remoteDir);
+    final n = safeFileName(name);
+    for (final t in transfers) {
+      if (t.kind != DriveTransferKind.download) continue;
+      if (normalizeNasPath(t.remoteDir) != dir) continue;
+      if (t.name != n) continue;
+      return t;
+    }
+    return null;
+  }
 
   String get displayTitle {
     final r = remark.trim();

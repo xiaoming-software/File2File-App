@@ -41,8 +41,15 @@ class DriveController extends ChangeNotifier {
   final Map<int, String> _pendingListPath = {};
   final Map<String, _RecvFile> _recv = {};
   final Map<String, Completer<bool>> _opWait = {};
+  final Map<String, Future<void>> _chunkWriteChain = {};
   final Set<String> _uploadBusy = {};
   final Set<String> _downloadBusy = {};
+
+  /// sessionId::dir::name -> local jpeg path
+  final Map<String, String> _thumbPaths = {};
+  final Set<String> _thumbPending = {};
+  final Set<String> _thumbFailed = {};
+  static const thumbEdge = 192;
 
   StreamSubscription<WebrpcDataEvent>? _dataSub;
   StreamSubscription<WebrpcFileChunkEvent>? _fileSub;
@@ -514,43 +521,120 @@ class DriveController extends ChangeNotifier {
     unawaited(_pumpUploads(session));
   }
 
-  /// Queue downloads (serial).
+  /// Queue downloads (serial). Reuses existing queued/running/complete tasks.
   void enqueueDownloads(DriveSession session, List<NasEntry> entries) {
     _ensureConnected(session);
-    for (final entry in entries) {
-      if (entry.isDir) continue;
-      final name = safeFileName(entry.name);
-      session.transfers.insert(
-        0,
-        DriveTransfer(
-          id: _uuid.v4(),
-          kind: DriveTransferKind.download,
-          name: name,
-          remoteDir: session.currentPath,
-          status: DriveTransferStatus.queued,
-          size: entry.size,
-        ),
-      );
-    }
-    notifyListeners();
-    unawaited(_pumpDownloads(session));
+    unawaited(() async {
+      for (final entry in entries) {
+        if (entry.isDir) continue;
+        await startDownload(session, entry, remoteDir: session.currentPath);
+      }
+    }());
   }
 
-  /// Start a download task and return immediately (does not wait for finish).
-  DriveTransfer startDownload(
+  /// Start or reuse a download. Completes immediately with the transfer handle.
+  ///
+  /// When [forPreview] is true and a **new** task is created, closing the preview
+  /// may cancel it via [releasePreviewDownload].
+  Future<DriveTransfer> startDownload(
     DriveSession session,
     NasEntry entry, {
     String? remoteDir,
-  }) {
+    bool forPreview = false,
+  }) async {
     _ensureConnected(session);
     if (entry.isDir) throw StateError('不能下载目录');
+    final dir = normalizeNasPath(remoteDir ?? session.currentPath);
+    final name = safeFileName(entry.name);
+
+    final existing = session.findDownload(dir, name);
+    if (existing != null) {
+      if (existing.status == DriveTransferStatus.queued ||
+          existing.status == DriveTransferStatus.running) {
+        if (entry.size > 0 && existing.size <= 0) existing.size = entry.size;
+        // Shared with another opener — do not cancel when one preview closes.
+        existing.cancelableByPreview = false;
+        return existing;
+      }
+      if (existing.status == DriveTransferStatus.done &&
+          await _isLocalComplete(existing, entry.size)) {
+        if (entry.size > 0) existing.size = entry.size;
+        existing.cancelableByPreview = false;
+        return existing;
+      }
+      // Failed / cancelled / done-but-empty stub: reuse the same task slot.
+      if (existing.localPath.isNotEmpty) {
+        try {
+          final f = File(existing.localPath);
+          if (await f.exists()) {
+            final len = await f.length();
+            final ok = entry.size > 0 ? len >= entry.size : len > 0;
+            if (!ok) await f.delete();
+          }
+        } catch (_) {}
+      }
+      existing.status = DriveTransferStatus.queued;
+      existing.size = entry.size;
+      existing.transferred = 0;
+      existing.localPath = '';
+      existing.error = '';
+      existing.cancelRequested = false;
+      existing.cancelableByPreview = forPreview;
+      existing.speedBps = 0;
+      existing.startedAt = null;
+      notifyListeners();
+      unawaited(_pumpDownloads(session));
+      return existing;
+    }
+
+    // Only reuse orphan local files when listing size is known and matches.
+    // size==0 in listings is common for txt; never treat empty stubs as complete.
+    if (entry.size > 0) {
+      final local =
+          await _store.downloadPath(_ownerToken, session.peerToken, name);
+      final localFile = File(local);
+      if (await localFile.exists()) {
+        final len = await localFile.length();
+        if (len >= entry.size) {
+          if (existing != null &&
+              (existing.status == DriveTransferStatus.failed ||
+                  existing.status == DriveTransferStatus.cancelled ||
+                  existing.status == DriveTransferStatus.done)) {
+            existing.status = DriveTransferStatus.done;
+            existing.localPath = local;
+            existing.transferred = len;
+            existing.size = entry.size;
+            existing.error = '';
+            existing.cancelRequested = false;
+            existing.cancelableByPreview = false;
+            notifyListeners();
+            return existing;
+          }
+          final done = DriveTransfer(
+            id: _uuid.v4(),
+            kind: DriveTransferKind.download,
+            name: name,
+            remoteDir: dir,
+            status: DriveTransferStatus.done,
+            size: entry.size,
+            transferred: len,
+            localPath: local,
+          );
+          session.transfers.insert(0, done);
+          notifyListeners();
+          return done;
+        }
+      }
+    }
+
     final t = DriveTransfer(
       id: _uuid.v4(),
       kind: DriveTransferKind.download,
-      name: safeFileName(entry.name),
-      remoteDir: remoteDir ?? session.currentPath,
+      name: name,
+      remoteDir: dir,
       status: DriveTransferStatus.queued,
       size: entry.size,
+      cancelableByPreview: forPreview,
     );
     session.transfers.insert(0, t);
     notifyListeners();
@@ -563,16 +647,61 @@ class DriveController extends ChangeNotifier {
     NasEntry entry, {
     String? remoteDir,
   }) async {
-    final t = startDownload(session, entry, remoteDir: remoteDir);
-    // Wait until finished / failed.
+    final t = await startDownload(session, entry, remoteDir: remoteDir);
     while (t.status == DriveTransferStatus.queued ||
         t.status == DriveTransferStatus.running) {
       await Future<void>.delayed(const Duration(milliseconds: 200));
     }
-    if (t.status == DriveTransferStatus.failed) {
+    if (t.status == DriveTransferStatus.failed ||
+        t.status == DriveTransferStatus.cancelled) {
       throw StateError(t.error.isEmpty ? '下载失败' : t.error);
     }
     return t;
+  }
+
+  Future<bool> _isLocalComplete(DriveTransfer t, int expectedSize) async {
+    if (t.localPath.isEmpty) return false;
+    final f = File(t.localPath);
+    if (!await f.exists()) return false;
+    final len = await f.length();
+    if (len <= 0) return false;
+    if (expectedSize > 0) return len >= expectedSize;
+    if (t.size > 0) return len >= t.size;
+    // Unknown size: only trust if we previously received real bytes.
+    return t.transferred > 0 && len >= t.transferred;
+  }
+
+  /// Cancel a queued/running download (used by preview dispose and task list).
+  void cancelTransfer(DriveSession session, DriveTransfer t) {
+    if (t.kind != DriveTransferKind.download) return;
+    if (t.status == DriveTransferStatus.queued) {
+      t.status = DriveTransferStatus.cancelled;
+      t.error = '已取消';
+      t.cancelRequested = false;
+      notifyListeners();
+      return;
+    }
+    if (t.status != DriveTransferStatus.running) return;
+    t.cancelRequested = true;
+    t.error = '已取消';
+    String? recvKey;
+    _recv.forEach((k, v) {
+      if (v.transferId == t.id) recvKey = k;
+    });
+    if (recvKey != null) _recv.remove(recvKey);
+    final c = _opWait.remove('dl:${t.id}');
+    if (c != null && !c.isCompleted) c.complete(false);
+    t.status = DriveTransferStatus.cancelled;
+    notifyListeners();
+  }
+
+  /// Preview closed: cancel only if this download was created for that preview.
+  void releasePreviewDownload(DriveSession session, DriveTransfer t) {
+    if (!t.cancelableByPreview) return;
+    if (t.status == DriveTransferStatus.queued ||
+        t.status == DriveTransferStatus.running) {
+      cancelTransfer(session, t);
+    }
   }
 
   Future<void> putTextFile(
@@ -612,10 +741,15 @@ class DriveController extends ChangeNotifier {
   }
 
   Future<void> retryTransfer(DriveSession session, DriveTransfer t) async {
-    if (t.status != DriveTransferStatus.failed) return;
+    if (t.status != DriveTransferStatus.failed &&
+        t.status != DriveTransferStatus.cancelled) {
+      return;
+    }
     t.status = DriveTransferStatus.queued;
     t.error = '';
     t.transferred = 0;
+    t.cancelRequested = false;
+    t.cancelableByPreview = false;
     notifyListeners();
     if (t.kind == DriveTransferKind.upload) {
       unawaited(_pumpUploads(session));
@@ -628,13 +762,17 @@ class DriveController extends ChangeNotifier {
     session.transfers.removeWhere(
       (t) =>
           t.status == DriveTransferStatus.done ||
-          t.status == DriveTransferStatus.failed,
+          t.status == DriveTransferStatus.failed ||
+          t.status == DriveTransferStatus.cancelled,
     );
     notifyListeners();
   }
 
   void removeTask(DriveSession session, DriveTransfer t) {
-    if (t.status == DriveTransferStatus.running) return;
+    if (t.status == DriveTransferStatus.running) {
+      cancelTransfer(session, t);
+      return;
+    }
     session.transfers.removeWhere((e) => e.id == t.id);
     notifyListeners();
   }
@@ -644,6 +782,137 @@ class DriveController extends ChangeNotifier {
       if (t.id == id) return t;
     }
     return null;
+  }
+
+  String thumbCacheKey(DriveSession session, String remoteDir, String name) {
+    return '${session.id}::${normalizeNasPath(remoteDir)}::${safeFileName(name)}';
+  }
+
+  String? thumbLocalPath(DriveSession session, String remoteDir, String name) {
+    return _thumbPaths[thumbCacheKey(session, remoteDir, name)];
+  }
+
+  bool thumbFailed(DriveSession session, String remoteDir, String name) {
+    return _thumbFailed.contains(thumbCacheKey(session, remoteDir, name));
+  }
+
+  /// Ask server for missing image/video thumbnails (idempotent, rate-limited by pending set).
+  void ensureThumbs(
+    DriveSession session,
+    Iterable<NasEntry> entries, {
+    String? remoteDir,
+  }) {
+    if (!session.connected || session.rpcSessionId == 0) return;
+    final dir = normalizeNasPath(remoteDir ?? session.currentPath);
+    for (final entry in entries) {
+      if (entry.isDir) continue;
+      final kind = entry.previewKind;
+      if (kind != DrivePreviewKind.image && kind != DrivePreviewKind.video) {
+        continue;
+      }
+      final key = thumbCacheKey(session, dir, entry.name);
+      if (_thumbPaths.containsKey(key) ||
+          _thumbPending.contains(key) ||
+          _thumbFailed.contains(key)) {
+        continue;
+      }
+      _thumbPending.add(key);
+      unawaited(_requestThumb(session, dir, entry.name, key));
+    }
+  }
+
+  Future<void> _requestThumb(
+    DriveSession session,
+    String dir,
+    String name,
+    String key,
+  ) async {
+    try {
+      final cached = await _store.thumbPath(
+        _ownerToken,
+        session.peerToken,
+        dir,
+        name,
+        edge: thumbEdge,
+      );
+      if (await File(cached).exists() && await File(cached).length() > 0) {
+        _thumbPaths[key] = cached;
+        _thumbPending.remove(key);
+        notifyListeners();
+        return;
+      }
+    } catch (_) {}
+    if (!session.connected || session.rpcSessionId == 0) {
+      _thumbPending.remove(key);
+      return;
+    }
+    final ok = _webrpc.sendJson(
+      session.rpcSessionId,
+      {
+        'type': 'getThumb',
+        'fileName': name,
+        'filePath': dir,
+        'maxEdge': thumbEdge,
+      },
+      timeoutMs: 15000,
+    );
+    if (!ok) {
+      _thumbPending.remove(key);
+      _thumbFailed.add(key);
+      notifyListeners();
+    }
+  }
+
+  void ensureSearchThumbs(DriveSession session, Iterable<NasSearchHit> hits) {
+    for (final hit in hits) {
+      if (hit.isDir) continue;
+      final kind = drivePreviewKind(hit.name);
+      if (kind != DrivePreviewKind.image && kind != DrivePreviewKind.video) {
+        continue;
+      }
+      ensureThumbs(
+        session,
+        [NasEntry(name: hit.name, isDir: false)],
+        remoteDir: hit.filePath,
+      );
+    }
+  }
+
+  Future<void> _onBackThumb(DriveSession session, Map<String, dynamic> json) async {
+    final name = safeFileName('${json['fileName'] ?? ''}');
+    final dir = normalizeNasPath('${json['filePath'] ?? session.currentPath}');
+    if (name.isEmpty) return;
+    final key = thumbCacheKey(session, dir, name);
+    _thumbPending.remove(key);
+    final ok = json['ok'] == true;
+    final dataB64 = '${json['data'] ?? ''}';
+    if (!ok || dataB64.isEmpty) {
+      _thumbFailed.add(key);
+      notifyListeners();
+      return;
+    }
+    try {
+      final bytes = base64Decode(dataB64);
+      if (bytes.isEmpty) {
+        _thumbFailed.add(key);
+        notifyListeners();
+        return;
+      }
+      final path = await _store.thumbPath(
+        _ownerToken,
+        session.peerToken,
+        dir,
+        name,
+        edge: thumbEdge,
+      );
+      await File(path).writeAsBytes(bytes, flush: true);
+      _thumbPaths[key] = path;
+      _thumbFailed.remove(key);
+      notifyListeners();
+    } catch (_) {
+      _thumbFailed.add(key);
+      notifyListeners();
+    }
   }
 
   Future<void> _pumpUploads(DriveSession session) async {
@@ -739,9 +1008,16 @@ class DriveController extends ChangeNotifier {
   }
 
   Future<void> _runDownload(DriveSession session, DriveTransfer t) async {
+    if (t.cancelRequested || t.status == DriveTransferStatus.cancelled) {
+      t.status = DriveTransferStatus.cancelled;
+      t.error = t.error.isEmpty ? '已取消' : t.error;
+      notifyListeners();
+      return;
+    }
     t.status = DriveTransferStatus.running;
     t.startedAt = DateTime.now();
     t.error = '';
+    t.cancelRequested = false;
     notifyListeners();
     try {
       _ensureConnected(session);
@@ -752,11 +1028,22 @@ class DriveController extends ChangeNotifier {
       );
       t.localPath = local;
       final f = File(local);
-      if (await f.exists()) await f.delete();
-      if (t.size == 0) {
-        await f.writeAsBytes(const []);
-        t.status = DriveTransferStatus.done;
-        t.transferred = 0;
+      if (await f.exists()) {
+        final len = await f.length();
+        // Only skip network when listing size is known and local file matches.
+        if (t.size > 0 && len >= t.size) {
+          t.transferred = len;
+          t.status = DriveTransferStatus.done;
+          notifyListeners();
+          return;
+        }
+        await f.delete();
+      }
+      // IMPORTANT: size==0 often means "unknown" (common for txt), NOT empty.
+      // Always request getFile; completion comes from chunks / backFile.
+      if (t.cancelRequested) {
+        t.status = DriveTransferStatus.cancelled;
+        t.error = '已取消';
         notifyListeners();
         return;
       }
@@ -778,14 +1065,23 @@ class DriveController extends ChangeNotifier {
         _opWait.remove('dl:${t.id}');
         throw StateError('请求下载失败');
       }
+      final waitSeconds = t.size > 0
+          ? (t.size / 1024).clamp(60, 3600).toInt()
+          : 600;
       final success = await done.future.timeout(
-        Duration(seconds: (t.size / 1024).clamp(60, 3600).toInt()),
+        Duration(seconds: waitSeconds),
         onTimeout: () {
           _recv.remove(key);
           _opWait.remove('dl:${t.id}');
           return t.status == DriveTransferStatus.done;
         },
       );
+      if (t.cancelRequested || t.status == DriveTransferStatus.cancelled) {
+        t.status = DriveTransferStatus.cancelled;
+        t.error = '已取消';
+        notifyListeners();
+        return;
+      }
       if (!success && t.status != DriveTransferStatus.done) {
         throw StateError('下载超时或失败');
       }
@@ -794,8 +1090,13 @@ class DriveController extends ChangeNotifier {
       }
       notifyListeners();
     } catch (e) {
-      t.status = DriveTransferStatus.failed;
-      t.error = e.toString();
+      if (t.cancelRequested || t.status == DriveTransferStatus.cancelled) {
+        t.status = DriveTransferStatus.cancelled;
+        t.error = '已取消';
+      } else {
+        t.status = DriveTransferStatus.failed;
+        t.error = e.toString();
+      }
       notifyListeners();
     }
   }
@@ -838,8 +1139,12 @@ class DriveController extends ChangeNotifier {
       case 'backPath':
         _onBackPath(session, json);
         break;
+      case 'backThumb':
+        unawaited(_onBackThumb(session, json));
+        break;
       case 'backFile':
-        _onBackFile(session, json);
+        // Must await pending chunk writes; otherwise small files finish as 0 bytes.
+        unawaited(_onBackFile(session, json));
         break;
       case 'backCreateFile':
         _completeOp(
@@ -925,28 +1230,79 @@ class DriveController extends ChangeNotifier {
     session.listing = false;
     session.listError = '';
     notifyListeners();
+    // Prefetch thumbs for media in this directory (server generates/caches).
+    ensureThumbs(session, entries);
   }
 
-  void _onBackFile(DriveSession session, Map<String, dynamic> json) {
+  Future<void> _drainChunkWrites(String key) async {
+    // Chunk handler is async and scheduled via broadcast listen; backFile can
+    // arrive while writes are still queued. Drain until the chain is idle.
+    for (var i = 0; i < 100; i++) {
+      final pending = _chunkWriteChain[key];
+      if (pending == null) break;
+      try {
+        await pending;
+      } catch (_) {}
+      await Future<void>.delayed(Duration.zero);
+    }
+  }
+
+  Future<void> _onBackFile(DriveSession session, Map<String, dynamic> json) async {
     final name = safeFileName('${json['fileName'] ?? ''}');
     if (name.isEmpty) return;
     final key = '${session.rpcSessionId}::$name';
+
+    // Yield so already-dispatched chunk listeners can register on the write chain
+    // before we finalize (critical for tiny txt/mp3 where backFile follows immediately).
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    await _drainChunkWrites(key);
+
     final recv = _recv.remove(key);
-    DriveTransfer? t;
-    if (recv != null) {
-      t = transferById(session, recv.transferId);
-      if (t != null) {
-        t.transferred = recv.bytes;
-        t.localPath = recv.path;
-        t.status = DriveTransferStatus.done;
-        if (t.startedAt != null) {
-          final elapsed =
-              DateTime.now().difference(t.startedAt!).inMilliseconds.clamp(1, 1 << 30);
-          t.speedBps = recv.bytes * 1000 ~/ elapsed;
-        }
-        final c = _opWait.remove('dl:${t.id}');
-        if (c != null && !c.isCompleted) c.complete(true);
+    if (recv == null) {
+      notifyListeners();
+      return;
+    }
+
+    // One more drain in case a chunk registered during remove.
+    await _drainChunkWrites(key);
+
+    final t = transferById(session, recv.transferId);
+    if (t == null) {
+      notifyListeners();
+      return;
+    }
+
+    var bytes = recv.bytes;
+    try {
+      final f = File(recv.path);
+      if (await f.exists()) {
+        final len = await f.length();
+        if (len > bytes) bytes = len;
       }
+    } catch (_) {}
+
+    t.transferred = bytes;
+    t.localPath = recv.path;
+    if (t.size <= 0 && bytes > 0) t.size = bytes;
+
+    if (t.cancelRequested || t.status == DriveTransferStatus.cancelled) {
+      t.status = DriveTransferStatus.cancelled;
+      t.error = '已取消';
+    } else if (bytes <= 0 && t.size > 0) {
+      t.status = DriveTransferStatus.failed;
+      t.error = '未收到文件数据（0 字节）';
+    } else {
+      t.status = DriveTransferStatus.done;
+    }
+
+    if (t.startedAt != null && bytes > 0) {
+      final elapsed =
+          DateTime.now().difference(t.startedAt!).inMilliseconds.clamp(1, 1 << 30);
+      t.speedBps = bytes * 1000 ~/ elapsed;
+    }
+    final c = _opWait.remove('dl:${t.id}');
+    if (c != null && !c.isCompleted) {
+      c.complete(t.status == DriveTransferStatus.done);
     }
     notifyListeners();
   }
@@ -973,6 +1329,7 @@ class DriveController extends ChangeNotifier {
     }
     session.searchHits = results;
     notifyListeners();
+    ensureSearchThumbs(session, results);
   }
 
   Future<void> _onFileChunk(WebrpcFileChunkEvent event) async {
@@ -982,30 +1339,54 @@ class DriveController extends ChangeNotifier {
     final name = safeFileName(event.fileName);
     if (name.isEmpty) return;
     final key = '${event.sessionId}::$name';
-    final recv = _recv[key];
-    if (recv == null) return;
-    final out = File(recv.path);
-    if (recv.bytes == 0 && await out.exists()) {
-      await out.delete();
-    }
-    await out.writeAsBytes(event.bytes, mode: FileMode.append, flush: true);
-    recv.bytes += event.bytes.length;
-    final t = transferById(session, recv.transferId);
-    if (t != null) {
-      t.transferred = recv.bytes;
-      if (recv.size > 0) t.size = recv.size;
-      if (t.startedAt != null) {
-        final elapsed =
-            DateTime.now().difference(t.startedAt!).inMilliseconds.clamp(1, 1 << 30);
-        t.speedBps = recv.bytes * 1000 ~/ elapsed;
-      }
-      if (recv.size > 0 && recv.bytes >= recv.size) {
-        t.status = DriveTransferStatus.done;
+
+    final previous = _chunkWriteChain[key] ?? Future<void>.value();
+    final gate = Completer<void>();
+    _chunkWriteChain[key] = gate.future;
+    await previous;
+    try {
+      final recv = _recv[key];
+      if (recv == null) return;
+      final t = transferById(session, recv.transferId);
+      if (t != null &&
+          (t.cancelRequested || t.status == DriveTransferStatus.cancelled)) {
         _recv.remove(key);
         final c = _opWait.remove('dl:${t.id}');
-        if (c != null && !c.isCompleted) c.complete(true);
+        if (c != null && !c.isCompleted) c.complete(false);
+        t.status = DriveTransferStatus.cancelled;
+        t.error = '已取消';
+        notifyListeners();
+        return;
       }
-      notifyListeners();
+      final out = File(recv.path);
+      if (recv.bytes == 0 && await out.exists()) {
+        await out.delete();
+      }
+      await out.writeAsBytes(event.bytes, mode: FileMode.append, flush: true);
+      recv.bytes += event.bytes.length;
+      if (t != null) {
+        t.transferred = recv.bytes;
+        if (recv.size > 0) t.size = recv.size;
+        if (t.startedAt != null) {
+          final elapsed = DateTime.now()
+              .difference(t.startedAt!)
+              .inMilliseconds
+              .clamp(1, 1 << 30);
+          t.speedBps = recv.bytes * 1000 ~/ elapsed;
+        }
+        if (recv.size > 0 && recv.bytes >= recv.size) {
+          t.status = DriveTransferStatus.done;
+          _recv.remove(key);
+          final c = _opWait.remove('dl:${t.id}');
+          if (c != null && !c.isCompleted) c.complete(true);
+        }
+        notifyListeners();
+      }
+    } finally {
+      if (!gate.isCompleted) gate.complete();
+      if (identical(_chunkWriteChain[key], gate.future)) {
+        _chunkWriteChain.remove(key);
+      }
     }
   }
 

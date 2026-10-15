@@ -435,20 +435,15 @@ class ChatController extends ChangeNotifier {
     final rpcId = frameSessionId != 0 ? frameSessionId : helloSid;
     if (rpcId == 0) return;
 
-    // Drive / voice media sessions must not become chat sessions.
-    if (_drive?.ownsRpc(rpcId) == true || _drive?.ownsPeer(token) == true) {
+    // Only skip when THIS frame belongs to an active drive rpc.
+    // Do not use ownsPeer — chat and drive can share a peer token with different rpcs.
+    if (_drive?.ownsRpc(rpcId) == true) {
       return;
     }
 
-    // Voice/media OpenSession hello: same peer, different rpc — do not rebind chat.
     final existingPeer = _findByPeer(token);
-    if (existingPeer != null &&
-        existingPeer.connected &&
-        existingPeer.rpcSessionId != 0 &&
-        existingPeer.rpcSessionId != rpcId) {
-      _voice?.onInboundSecondarySession(rpcId, existingPeer);
-      return;
-    }
+
+    // Voice/media transport hello: keep chat on its existing rpc.
     if (_voice?.shouldSkipChatHello(rpcId, token) == true) {
       if (existingPeer != null) {
         _voice?.onInboundSecondarySession(rpcId, existingPeer);
@@ -467,6 +462,18 @@ class ChatController extends ChangeNotifier {
       );
       sessions.insert(0, session);
       selectedId ??= session.id;
+    } else if (session.rpcSessionId != 0 &&
+        session.rpcSessionId != rpcId &&
+        session.connected) {
+      // Peer (e.g. Desktop) OpenSession'd to us — rebind chat to the live rpc,
+      // matching Desktop applyPeerHello which always updates rpcSessionId.
+      final old = session.rpcSessionId;
+      debugPrint(
+        'chat: rebind peer=$token rpc ${session.rpcSessionId} -> $rpcId',
+      );
+      try {
+        _webrpc.closeSession(old);
+      } catch (_) {}
     }
     session.peerToken = token;
     if (permission.isNotEmpty) session.peerPass = permission;
@@ -488,8 +495,36 @@ class ChatController extends ChangeNotifier {
     }
   }
 
+  /// Resolve chat session for an inbound frame; rebind if Desktop uses a new rpc.
+  ChatSession? _sessionForIncoming(int rpcSessionId) {
+    if (rpcSessionId == 0) return null;
+    if (_drive?.ownsRpc(rpcSessionId) == true) return null;
+    if (_voice?.isMediaRpc(rpcSessionId) == true) return null;
+
+    final byRpc = _findByRpc(rpcSessionId);
+    if (byRpc != null) return byRpc;
+
+    final token = _webrpc.peerTokenOf(rpcSessionId);
+    if (token.isEmpty || token == _ownerToken) return null;
+    final byPeer = _findByPeer(token);
+    if (byPeer == null) return null;
+    if (byPeer.rpcSessionId != rpcSessionId) {
+      debugPrint(
+        'chat: attach inbound rpc=$rpcSessionId to peer=$token '
+        '(was ${byPeer.rpcSessionId})',
+      );
+      byPeer.rpcSessionId = rpcSessionId;
+      byPeer.connected = true;
+      byPeer.connecting = false;
+      byPeer.connectError = '';
+      notifyListeners();
+      unawaited(_persistSessions());
+    }
+    return byPeer;
+  }
+
   void _onText(int rpcSessionId, String text) {
-    final session = _findByRpc(rpcSessionId);
+    final session = _sessionForIncoming(rpcSessionId);
     if (session == null) return;
     session.messages.add(
       ChatMessage(
@@ -507,7 +542,7 @@ class ChatController extends ChangeNotifier {
   }
 
   void _onFileQuery(int rpcSessionId, Map<String, dynamic> data) {
-    final session = _findByRpc(rpcSessionId);
+    final session = _sessionForIncoming(rpcSessionId);
     if (session == null) return;
     final name = safeFileName('${data['fileName'] ?? ''}');
     if (name.isEmpty) return;
@@ -553,7 +588,7 @@ class ChatController extends ChangeNotifier {
   }
 
   void _onFileReply(int rpcSessionId, Map<String, dynamic> data) {
-    final session = _findByRpc(rpcSessionId);
+    final session = _sessionForIncoming(rpcSessionId);
     if (session == null) return;
     final name = safeFileName('${data['fileName'] ?? ''}');
     final bytes = (data['bytes'] as num?)?.toInt() ?? 0;
@@ -575,7 +610,8 @@ class ChatController extends ChangeNotifier {
 
   Future<void> _onFileChunk(WebrpcFileChunkEvent event) async {
     if (_drive?.ownsRpc(event.sessionId) == true) return;
-    final session = _findByRpc(event.sessionId);
+    if (_voice?.isMediaRpc(event.sessionId) == true) return;
+    final session = _sessionForIncoming(event.sessionId);
     if (session == null) return;
     final name = safeFileName(event.fileName);
     if (name.isEmpty) return;

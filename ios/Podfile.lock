@@ -2,6 +2,10 @@ PODS:
   - Flutter (1.0.0)
   - flutter_pcm_sound (0.0.1):
     - Flutter
+  - media_kit_libs_ios_video (1.0.4):
+    - Flutter
+  - media_kit_video (0.0.1):
+    - Flutter
   - open_filex (0.0.2):
     - Flutter
   - opus_flutter_ios (0.0.2):
@@ -10,6 +14,8 @@ PODS:
 DEPENDENCIES:
   - Flutter (from `Flutter`)
   - flutter_pcm_sound (from `.symlinks/plugins/flutter_pcm_sound/ios`)
+  - media_kit_libs_ios_video (from `.symlinks/plugins/media_kit_libs_ios_video/ios`)
+  - media_kit_video (from `.symlinks/plugins/media_kit_video/ios`)
   - open_filex (from `.symlinks/plugins/open_filex/ios`)
   - opus_flutter_ios (from `.symlinks/plugins/opus_flutter_ios/ios`)
 
@@ -18,6 +24,10 @@ EXTERNAL SOURCES:
     :path: Flutter
   flutter_pcm_sound:
     :path: ".symlinks/plugins/flutter_pcm_sound/ios"
+  media_kit_libs_ios_video:
+    :path: ".symlinks/plugins/media_kit_libs_ios_video/ios"
+  media_kit_video:
+    :path: ".symlinks/plugins/media_kit_video/ios"
   open_filex:
     :path: ".symlinks/plugins/open_filex/ios"
   opus_flutter_ios:
@@ -26,6 +36,8 @@ EXTERNAL SOURCES:
 SPEC CHECKSUMS:
   Flutter: 71a624a5bc0c04062bf19101d501e466baf2fb47
   flutter_pcm_sound: de0572ca4f99091cc2abfcc31601b8a4ddd33c0e
+  media_kit_libs_ios_video: a5fe24bc7875ccd6378a0978c13185e1344651c1
+  media_kit_video: 5da63f157170e5bf303bf85453b7ef6971218a2e
   open_filex: 6e26e659846ec990262224a12ef1c528bb4edbe4
   opus_flutter_ios: 3df5f9d5bedf0818e7e2c9b94b7baf8d837101c4
 

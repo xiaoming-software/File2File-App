@@ -4,8 +4,10 @@ import 'dart:io';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:media_kit/media_kit.dart';
+import 'package:media_kit_video/media_kit_video.dart';
 import 'package:provider/provider.dart';
-import 'package:video_player/video_player.dart';
+import 'package:video_player/video_player.dart' as vp;
 
 import '../models/drive_models.dart';
 import '../services/drive_controller.dart';
@@ -29,6 +31,9 @@ class DrivePreviewScreen extends StatefulWidget {
 }
 
 class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
+  static const _playerOpenTimeout = Duration(seconds: 15);
+
+  DriveController? _drive;
   DriveTransfer? _transfer;
   String? _localPath;
   String? _error;
@@ -36,13 +41,31 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
   final _textCtrl = TextEditingController();
   bool _textDirty = false;
   bool _saving = false;
-  VideoPlayerController? _player;
+
+  Player? _mkPlayer;
+  VideoController? _mkVideo;
+  StreamSubscription<String>? _mkErrorSub;
+  vp.VideoPlayerController? _vpPlayer;
   bool _playerReady = false;
   bool _openingPlayer = false;
+  bool _usingVideoPlayer = false;
   Timer? _poll;
   final _saver = MediaSaveService();
 
   DrivePreviewKind get _kind => widget.entry.previewKind;
+
+  bool get _isMedia =>
+      _kind == DrivePreviewKind.audio || _kind == DrivePreviewKind.video;
+
+  String get _ext {
+    final n = widget.entry.name.toLowerCase();
+    final i = n.lastIndexOf('.');
+    return i < 0 ? '' : n.substring(i);
+  }
+
+  /// System player is usually best for common MP4; media_kit covers MOV/MP3/etc.
+  bool get _preferSystemPlayer =>
+      _ext == '.mp4' || _ext == '.m4v' || _ext == '.m4a';
 
   @override
   void initState() {
@@ -51,15 +74,53 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
   }
 
   @override
+  void didChangeDependencies() {
+    super.didChangeDependencies();
+    _drive ??= context.read<DriveController>();
+  }
+
+  @override
   void dispose() {
     _poll?.cancel();
     _textCtrl.dispose();
-    _player?.dispose();
+    unawaited(_disposePlayer());
+
+    final drive = _drive;
+    final t = _transfer;
+    if (drive != null && t != null) {
+      final session = drive.sessionById(widget.sessionId);
+      if (session != null) {
+        drive.releasePreviewDownload(session, t);
+      }
+    }
     super.dispose();
+  }
+
+  Future<void> _disposePlayer() async {
+    await _mkErrorSub?.cancel();
+    _mkErrorSub = null;
+    final mk = _mkPlayer;
+    _mkPlayer = null;
+    _mkVideo = null;
+    if (mk != null) {
+      try {
+        await mk.dispose();
+      } catch (_) {}
+    }
+    final vpCtrl = _vpPlayer;
+    _vpPlayer = null;
+    if (vpCtrl != null) {
+      try {
+        await vpCtrl.dispose();
+      } catch (_) {}
+    }
+    _playerReady = false;
+    _usingVideoPlayer = false;
   }
 
   Future<void> _start() async {
     final drive = context.read<DriveController>();
+    _drive = drive;
     final session = drive.sessionById(widget.sessionId);
     if (session == null) {
       setState(() {
@@ -69,17 +130,30 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
       return;
     }
     try {
-      final t = drive.startDownload(
+      final t = await drive.startDownload(
         session,
         widget.entry,
         remoteDir: widget.remoteDir,
+        forPreview: true,
       );
-      if (!mounted) return;
+      if (!mounted) {
+        drive.releasePreviewDownload(session, t);
+        return;
+      }
       _transfer = t;
       _poll = Timer.periodic(const Duration(milliseconds: 400), (_) {
         if (!mounted) return;
         final cur = drive.transferById(session, t.id) ?? t;
         setState(() => _transfer = cur);
+        if (cur.status == DriveTransferStatus.failed ||
+            cur.status == DriveTransferStatus.cancelled) {
+          setState(() {
+            _loading = false;
+            _error = cur.error.isEmpty ? '下载失败' : cur.error;
+          });
+          _poll?.cancel();
+          return;
+        }
         unawaited(_maybeOpen(cur));
       });
       await _maybeOpen(t);
@@ -91,6 +165,65 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
         });
       }
     }
+  }
+
+  Future<void> _retryOpen() async {
+    setState(() {
+      _error = null;
+      _loading = true;
+      _playerReady = false;
+      _localPath = null;
+      _openingPlayer = false;
+    });
+    await _disposePlayer();
+    final drive = _drive;
+    if (drive == null) return;
+    final session = drive.sessionById(widget.sessionId);
+    final old = _transfer;
+    if (session != null && old != null) {
+      // Drop empty/broken cache so the next startDownload actually fetches again.
+      if (old.localPath.isNotEmpty) {
+        try {
+          final f = File(old.localPath);
+          if (await f.exists() && await f.length() <= 0) {
+            await f.delete();
+          }
+        } catch (_) {}
+      }
+      if (old.status == DriveTransferStatus.done && old.transferred <= 0) {
+        old.status = DriveTransferStatus.failed;
+        old.error = '内容为空，准备重新下载';
+      }
+      try {
+        final t = await drive.startDownload(
+          session,
+          widget.entry,
+          remoteDir: widget.remoteDir,
+          forPreview: true,
+        );
+        if (!mounted) return;
+        _transfer = t;
+        _poll?.cancel();
+        _poll = Timer.periodic(const Duration(milliseconds: 400), (_) {
+          if (!mounted) return;
+          final cur = drive.transferById(session, t.id) ?? t;
+          setState(() => _transfer = cur);
+          unawaited(_maybeOpen(cur));
+        });
+        await _maybeOpen(t);
+        return;
+      } catch (e) {
+        if (mounted) {
+          setState(() {
+            _loading = false;
+            _error = '$e';
+          });
+        }
+        return;
+      }
+    }
+    final t = _transfer;
+    if (t != null) await _maybeOpen(t);
   }
 
   Future<void> _maybeOpen(DriveTransfer t) async {
@@ -129,42 +262,77 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
       return;
     }
 
-    if (_kind != DrivePreviewKind.audio && _kind != DrivePreviewKind.video) {
+    if (!_isMedia) return;
+
+    // Wait until download finishes; do not require NAS size == local size
+    // (metadata size can be wrong and would leave UI stuck on "正在打开").
+    if (t.status != DriveTransferStatus.done) return;
+    if (_openingPlayer) return;
+    if (_playerReady && _localPath == t.localPath) {
+      _poll?.cancel();
       return;
     }
 
-    final need = widget.entry.size <= 0
-        ? 0
-        : (widget.entry.size * 0.05).clamp(256 * 1024, 2 * 1024 * 1024).toInt();
-    final ready = t.status == DriveTransferStatus.done ||
-        (widget.entry.size > 0 && t.transferred >= need);
-    if (!ready || _openingPlayer) return;
-    if (_playerReady && _localPath == t.localPath) {
-      if (t.status == DriveTransferStatus.done) _poll?.cancel();
+    final len = await file.length();
+    if (len <= 0) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = '下载内容为空（可能未真正拉取文件），请点重试';
+        });
+        _poll?.cancel();
+      }
       return;
     }
 
     _openingPlayer = true;
+    if (mounted) setState(() => _loading = true);
+    Object? lastError;
     try {
-      await _player?.dispose();
-      final c = VideoPlayerController.file(File(t.localPath));
-      await c.initialize();
-      await c.setLooping(true);
-      await c.play();
+      await _disposePlayer();
+      final preferSystem = _preferSystemPlayer && _kind == DrivePreviewKind.video;
+      final order = preferSystem
+          ? const ['system', 'mediakit']
+          : const ['mediakit', 'system'];
+      var opened = false;
+      for (final engine in order) {
+        if (_kind == DrivePreviewKind.audio && engine == 'system') {
+          // video_player is weak for many audio-only files; skip for audio.
+          continue;
+        }
+        try {
+          if (engine == 'system') {
+            await _openWithVideoPlayer(t.localPath);
+          } else {
+            await _openWithMediaKit(t.localPath);
+          }
+          opened = true;
+          break;
+        } catch (e) {
+          lastError = e;
+          await _disposePlayer();
+        }
+      }
+      if (!opened) {
+        throw lastError ?? StateError('无法打开媒体');
+      }
       if (!mounted) {
-        await c.dispose();
+        await _disposePlayer();
         return;
       }
       setState(() {
-        _player = c;
         _playerReady = true;
         _localPath = t.localPath;
         _loading = false;
+        _error = null;
       });
+      _poll?.cancel();
     } catch (e) {
-      if (t.status == DriveTransferStatus.done && mounted) {
+      await _disposePlayer();
+      if (mounted) {
         setState(() {
           _loading = false;
+          _playerReady = false;
           _error = '无法播放：$e';
         });
         _poll?.cancel();
@@ -172,7 +340,45 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
     } finally {
       _openingPlayer = false;
     }
-    if (t.status == DriveTransferStatus.done) _poll?.cancel();
+  }
+
+  Future<void> _openWithMediaKit(String path) async {
+    final player = Player();
+    final video = VideoController(player);
+    _mkPlayer = player;
+    _mkVideo = video;
+    _usingVideoPlayer = false;
+    _mkErrorSub = player.stream.error.listen((msg) {
+      if (!mounted || msg.trim().isEmpty) return;
+      setState(() {
+        _loading = false;
+        _playerReady = false;
+        _error = '无法播放：$msg';
+      });
+      _poll?.cancel();
+    });
+    // Try both URI forms; some iOS builds prefer one over the other.
+    Object? err;
+    for (final src in [Uri.file(path).toString(), path]) {
+      try {
+        await player.open(Media(src), play: true).timeout(_playerOpenTimeout);
+        err = null;
+        break;
+      } catch (e) {
+        err = e;
+      }
+    }
+    if (err != null) throw err;
+    await player.setPlaylistMode(PlaylistMode.loop);
+  }
+
+  Future<void> _openWithVideoPlayer(String path) async {
+    final c = vp.VideoPlayerController.file(File(path));
+    _vpPlayer = c;
+    _usingVideoPlayer = true;
+    await c.initialize().timeout(_playerOpenTimeout);
+    await c.setLooping(true);
+    await c.play();
   }
 
   Future<void> _saveText() async {
@@ -276,23 +482,67 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
       return Center(
         child: Padding(
           padding: const EdgeInsets.all(24),
-          child: Text(_error!, style: TextStyle(color: Colors.red.shade300)),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text(
+                _error!,
+                textAlign: TextAlign.center,
+                style: TextStyle(color: Colors.red.shade300),
+              ),
+              if (_isMedia) ...[
+                const SizedBox(height: 16),
+                FilledButton(
+                  onPressed: _retryOpen,
+                  child: const Text('重试打开'),
+                ),
+              ],
+            ],
+          ),
         ),
       );
     }
     if (_loading && !_playerReady && _localPath == null) {
+      final downloading = t != null &&
+          (t.status == DriveTransferStatus.queued ||
+              t.status == DriveTransferStatus.running);
+      final opening = t?.status == DriveTransferStatus.done;
+      final lightText = _kind == DrivePreviewKind.video ||
+          _kind == DrivePreviewKind.audio ||
+          _kind == DrivePreviewKind.image;
       return Center(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             const CircularProgressIndicator(),
             const SizedBox(height: 16),
-            if (t != null)
-              Text(
-                '下载中 ${(t.progress * 100).toStringAsFixed(0)}%'
-                '${t.size > 0 ? ' · ${formatBytes(t.transferred)}/${formatBytes(t.size)}' : ''}',
-                style: TextStyle(color: AppTheme.ink.withValues(alpha: 0.6)),
+            Text(
+              opening
+                  ? '正在打开…'
+                  : downloading
+                      ? (t.status == DriveTransferStatus.queued
+                          ? '排队下载中…'
+                          : '正在下载…')
+                      : '准备中…',
+              style: TextStyle(
+                color: lightText
+                    ? Colors.white70
+                    : AppTheme.ink.withValues(alpha: 0.6),
               ),
+            ),
+            if (t != null && downloading) ...[
+              const SizedBox(height: 8),
+              Text(
+                '${(t.progress * 100).toStringAsFixed(0)}%'
+                '${t.size > 0 ? ' · ${formatBytes(t.transferred)}/${formatBytes(t.size)}' : ''}'
+                '${t.speedBps > 0 ? ' · ${formatBytes(t.speedBps)}/s' : ''}',
+                style: TextStyle(
+                  color: lightText
+                      ? Colors.white54
+                      : AppTheme.ink.withValues(alpha: 0.45),
+                ),
+              ),
+            ],
           ],
         ),
       );
@@ -324,32 +574,64 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
         );
       case DrivePreviewKind.audio:
       case DrivePreviewKind.video:
-        if (!_playerReady || _player == null) {
+        if (!_playerReady) {
           return const Center(
             child: CircularProgressIndicator(color: Colors.white),
           );
         }
         final isAudio = _kind == DrivePreviewKind.audio;
-        return Column(
-          children: [
-            if (t != null && t.status == DriveTransferStatus.running)
-              LinearProgressIndicator(
-                value: t.size > 0 ? t.progress : null,
-                minHeight: 3,
-              ),
-            Expanded(
-              child: Center(
+        if (_usingVideoPlayer) {
+          final c = _vpPlayer;
+          if (c == null) {
+            return const Center(
+              child: CircularProgressIndicator(color: Colors.white),
+            );
+          }
+          return Column(
+            children: [
+              Expanded(
                 child: isAudio
-                    ? const Icon(Icons.audiotrack, size: 96, color: Colors.white70)
-                    : AspectRatio(
-                        aspectRatio: _player!.value.aspectRatio == 0
-                            ? 16 / 9
-                            : _player!.value.aspectRatio,
-                        child: VideoPlayer(_player!),
+                    ? const Center(
+                        child: Icon(
+                          Icons.audiotrack,
+                          size: 96,
+                          color: Colors.white70,
+                        ),
+                      )
+                    : Center(
+                        child: AspectRatio(
+                          aspectRatio: c.value.aspectRatio == 0
+                              ? 16 / 9
+                              : c.value.aspectRatio,
+                          child: vp.VideoPlayer(c),
+                        ),
                       ),
               ),
+              _VideoPlayerControls(controller: c),
+            ],
+          );
+        }
+        final mk = _mkPlayer;
+        final video = _mkVideo;
+        if (mk == null || video == null) {
+          return const Center(
+            child: CircularProgressIndicator(color: Colors.white),
+          );
+        }
+        return Column(
+          children: [
+            Expanded(
+              child: isAudio
+                  ? const Center(
+                      child: Icon(Icons.audiotrack, size: 96, color: Colors.white70),
+                    )
+                  : Video(
+                      controller: video,
+                      controls: NoVideoControls,
+                      fill: Colors.black,
+                    ),
             ),
-            _MediaControls(controller: _player!),
+            _MediaKitControls(player: mk),
           ],
         );
       case DrivePreviewKind.none:
@@ -358,13 +640,13 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
   }
 }
 
-class _MediaControls extends StatelessWidget {
-  const _MediaControls({required this.controller});
-  final VideoPlayerController controller;
+class _VideoPlayerControls extends StatelessWidget {
+  const _VideoPlayerControls({required this.controller});
+  final vp.VideoPlayerController controller;
 
   @override
   Widget build(BuildContext context) {
-    return ValueListenableBuilder<VideoPlayerValue>(
+    return ValueListenableBuilder<vp.VideoPlayerValue>(
       valueListenable: controller,
       builder: (context, value, _) {
         final pos = value.position;
@@ -374,10 +656,10 @@ class _MediaControls extends StatelessWidget {
             padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
             child: Column(
               children: [
-                VideoProgressIndicator(
+                vp.VideoProgressIndicator(
                   controller,
                   allowScrubbing: true,
-                  colors: const VideoProgressColors(
+                  colors: const vp.VideoProgressColors(
                     playedColor: Colors.white,
                     bufferedColor: Colors.white38,
                     backgroundColor: Colors.white24,
@@ -404,6 +686,89 @@ class _MediaControls extends StatelessWidget {
               ],
             ),
           ),
+        );
+      },
+    );
+  }
+
+  String _fmt(Duration d) {
+    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
+    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
+    final h = d.inHours;
+    if (h > 0) return '$h:$m:$s';
+    return '$m:$s';
+  }
+}
+
+class _MediaKitControls extends StatelessWidget {
+  const _MediaKitControls({required this.player});
+  final Player player;
+
+  @override
+  Widget build(BuildContext context) {
+    return StreamBuilder<bool>(
+      stream: player.stream.playing,
+      initialData: player.state.playing,
+      builder: (context, playingSnap) {
+        return StreamBuilder<Duration>(
+          stream: player.stream.position,
+          initialData: player.state.position,
+          builder: (context, posSnap) {
+            return StreamBuilder<Duration>(
+              stream: player.stream.duration,
+              initialData: player.state.duration,
+              builder: (context, durSnap) {
+                final playing = playingSnap.data ?? false;
+                final pos = posSnap.data ?? Duration.zero;
+                final dur = durSnap.data ?? Duration.zero;
+                final maxMs = dur.inMilliseconds <= 0 ? 1 : dur.inMilliseconds;
+                final value = (pos.inMilliseconds / maxMs).clamp(0.0, 1.0);
+                return SafeArea(
+                  child: Padding(
+                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                    child: Column(
+                      children: [
+                        SliderTheme(
+                          data: SliderTheme.of(context).copyWith(
+                            trackHeight: 2,
+                            thumbShape: const RoundSliderThumbShape(
+                              enabledThumbRadius: 6,
+                            ),
+                          ),
+                          child: Slider(
+                            value: value.toDouble(),
+                            onChanged: (v) {
+                              player.seek(
+                                Duration(milliseconds: (v * maxMs).round()),
+                              );
+                            },
+                          ),
+                        ),
+                        Row(
+                          children: [
+                            IconButton(
+                              onPressed: () {
+                                playing ? player.pause() : player.play();
+                              },
+                              icon: Icon(
+                                playing ? Icons.pause_circle : Icons.play_circle,
+                                color: Colors.white,
+                                size: 36,
+                              ),
+                            ),
+                            Text(
+                              '${_fmt(pos)} / ${_fmt(dur)}',
+                              style: const TextStyle(color: Colors.white70),
+                            ),
+                          ],
+                        ),
+                      ],
+                    ),
+                  ),
+                );
+              },
+            );
+          },
         );
       },
     );

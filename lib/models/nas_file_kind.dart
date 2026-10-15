@@ -22,7 +22,33 @@ const _imageExt = {
   'svg',
 };
 
-const _videoExt = {'mp4', 'mov', 'avi', 'mkv', 'webm', 'm4v'};
+const _videoExt = {
+  'mp4',
+  'm4v',
+  'mov',
+  'qt',
+  'mkv',
+  'webm',
+  'avi',
+  'wmv',
+  'asf',
+  'flv',
+  'f4v',
+  '3gp',
+  '3g2',
+  'ts',
+  'm2ts',
+  'mts',
+  'mpeg',
+  'mpg',
+  'mpe',
+  'vob',
+  'ogv',
+  'rm',
+  'rmvb',
+  'divx',
+  'xvid',
+};
 
 const _audioExt = {'mp3', 'wav', 'flac', 'aac', 'm4a', 'ogg', 'wma'};
 

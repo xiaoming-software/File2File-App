@@ -148,6 +148,18 @@ class WebrpcService {
     return _bindings!.closeSession(_handle, sessionId);
   }
 
+  /// Peer token for an active webrpc session (caller must free is handled here).
+  String peerTokenOf(int sessionId) {
+    if (!isOnline || sessionId == 0) return '';
+    final ptr = _bindings!.tarTokenBySession(_handle, sessionId);
+    if (ptr == nullptr) return '';
+    try {
+      return ptr.toDartString().trim();
+    } finally {
+      malloc.free(ptr);
+    }
+  }
+
   int sessionSize() {
     _ensureOnline();
     return _bindings!.sessionSize(_handle);

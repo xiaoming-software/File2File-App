@@ -1,6 +1,5 @@
 #!/usr/bin/env bash
 # 一键：用固定本机签名打包 Android APK，打 git tag，并发布为 GitHub Latest Release。
-# 不包含 Token / 密码；也不把 keystore 提交进仓库。
 #
 # 用法：
 #   1. 改下面的 VERSION_NAME
@@ -10,7 +9,7 @@
 set -euo pipefail
 
 # ======== 发版时只改这里 ========
-VERSION_NAME="0.1.0"
+VERSION_NAME="1.1.0"
 # =================================
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

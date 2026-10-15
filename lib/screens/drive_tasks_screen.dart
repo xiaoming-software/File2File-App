@@ -96,9 +96,11 @@ class _TaskCard extends StatelessWidget {
             '${task.speedBps > 0 ? ' · ${formatBytes(task.speedBps)}/s' : ''}',
       DriveTransferStatus.done => '已完成',
       DriveTransferStatus.failed => '失败',
+      DriveTransferStatus.cancelled => '已取消',
     };
     final color = switch (task.status) {
       DriveTransferStatus.failed => Colors.red.shade700,
+      DriveTransferStatus.cancelled => AppTheme.ink.withValues(alpha: 0.45),
       DriveTransferStatus.done => const Color(0xFF2E7D32),
       DriveTransferStatus.running => AppTheme.accent,
       DriveTransferStatus.queued => AppTheme.ink.withValues(alpha: 0.45),
@@ -132,13 +134,21 @@ class _TaskCard extends StatelessWidget {
                     style: const TextStyle(fontWeight: FontWeight.w600),
                   ),
                 ),
-                if (task.status == DriveTransferStatus.failed)
+                if (task.status == DriveTransferStatus.failed ||
+                    task.status == DriveTransferStatus.cancelled)
                   IconButton(
                     tooltip: '重试',
                     onPressed: () => drive.retryTransfer(session, task),
                     icon: const Icon(Icons.refresh, size: 20),
                   ),
-                if (task.status != DriveTransferStatus.running)
+                if (task.status == DriveTransferStatus.queued ||
+                    task.status == DriveTransferStatus.running)
+                  IconButton(
+                    tooltip: '取消',
+                    onPressed: () => drive.cancelTransfer(session, task),
+                    icon: const Icon(Icons.stop_circle_outlined, size: 20),
+                  )
+                else
                   IconButton(
                     tooltip: '移除',
                     onPressed: () => drive.removeTask(session, task),

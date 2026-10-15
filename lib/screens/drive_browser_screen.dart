@@ -8,7 +8,7 @@ import '../models/drive_models.dart';
 import '../models/nas_file_kind.dart';
 import '../services/drive_controller.dart';
 import '../theme/app_theme.dart';
-import '../widgets/nas_file_icon.dart';
+import '../widgets/nas_entry_leading.dart';
 import '../widgets/nas_storage_header.dart';
 import 'drive_move_screen.dart';
 import 'drive_preview_screen.dart';
@@ -25,6 +25,7 @@ class DriveBrowserScreen extends StatefulWidget {
 class _DriveBrowserScreenState extends State<DriveBrowserScreen> {
   bool _busy = false;
   bool _selectMode = false;
+  bool _gridMode = false;
   final Set<String> _selected = {};
   final _searchCtrl = TextEditingController();
   final _picker = ImagePicker();
@@ -400,6 +401,13 @@ class _DriveBrowserScreenState extends State<DriveBrowserScreen> {
             ),
           ] else ...[
             IconButton(
+              tooltip: _gridMode ? '列表' : '网格',
+              onPressed: !session.connected
+                  ? null
+                  : () => setState(() => _gridMode = !_gridMode),
+              icon: Icon(_gridMode ? Icons.view_list_rounded : Icons.grid_view_rounded),
+            ),
+            IconButton(
               tooltip: '多选',
               onPressed: !session.connected
                   ? null
@@ -622,8 +630,14 @@ class _DriveBrowserScreenState extends State<DriveBrowserScreen> {
           );
         }
         final hit = session.searchHits[index];
+        final asEntry = NasEntry(name: hit.name, isDir: hit.isDir);
         return ListTile(
-          leading: NasFileIcon.forName(hit.name, isDir: hit.isDir),
+          leading: NasEntryLeading(
+            sessionId: session.id,
+            entry: asEntry,
+            remoteDir: hit.filePath,
+            size: 44,
+          ),
           title: Text(hit.name),
           subtitle: Text(hit.filePath),
           onTap: () => _openSearchHit(session, hit),
@@ -643,6 +657,9 @@ class _DriveBrowserScreenState extends State<DriveBrowserScreen> {
           style: TextStyle(color: AppTheme.ink.withValues(alpha: 0.45)),
         ),
       );
+    }
+    if (_gridMode) {
+      return _buildGrid(session, dateFmt);
     }
     return ListView.separated(
       itemCount: session.entries.length,
@@ -668,7 +685,12 @@ class _DriveBrowserScreenState extends State<DriveBrowserScreen> {
                   value: selected,
                   onChanged: (_) => _toggleSelect(entry.name),
                 )
-              : NasFileIcon.forName(entry.name, isDir: entry.isDir),
+              : NasEntryLeading(
+                  sessionId: session.id,
+                  entry: entry,
+                  remoteDir: session.currentPath,
+                  size: 44,
+                ),
           title: Text(entry.name),
           subtitle: Text(subtitle),
           trailing: entry.isDir ? const Icon(Icons.chevron_right) : null,
@@ -690,6 +712,106 @@ class _DriveBrowserScreenState extends State<DriveBrowserScreen> {
                     _showItemActions(session, entry);
                   }
                 },
+        );
+      },
+    );
+  }
+
+  Widget _buildGrid(DriveSession session, DateFormat dateFmt) {
+    return GridView.builder(
+      padding: const EdgeInsets.fromLTRB(10, 8, 10, 88),
+      gridDelegate: const SliverGridDelegateWithFixedCrossAxisCount(
+        crossAxisCount: 3,
+        mainAxisSpacing: 10,
+        crossAxisSpacing: 10,
+        childAspectRatio: 0.78,
+      ),
+      itemCount: session.entries.length,
+      itemBuilder: (context, index) {
+        final entry = session.entries[index];
+        final selected = _selected.contains(entry.name);
+        final kind = classifyNasName(entry.name, isDir: entry.isDir);
+        return Material(
+          color: selected
+              ? AppTheme.accent.withValues(alpha: 0.12)
+              : Colors.white.withValues(alpha: 0.72),
+          borderRadius: BorderRadius.circular(12),
+          child: InkWell(
+            borderRadius: BorderRadius.circular(12),
+            onTap: _busy
+                ? null
+                : () {
+                    if (_selectMode) {
+                      _toggleSelect(entry.name);
+                    } else {
+                      _openEntry(session, entry);
+                    }
+                  },
+            onLongPress: _busy
+                ? null
+                : () {
+                    if (_selectMode) {
+                      _toggleSelect(entry.name);
+                    } else {
+                      _showItemActions(session, entry);
+                    }
+                  },
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(8, 10, 8, 8),
+              child: Column(
+                children: [
+                  Expanded(
+                    child: Stack(
+                      alignment: Alignment.center,
+                      children: [
+                        NasEntryLeading(
+                          sessionId: session.id,
+                          entry: entry,
+                          remoteDir: session.currentPath,
+                          size: 72,
+                        ),
+                        if (_selectMode)
+                          Positioned(
+                            top: 0,
+                            right: 0,
+                            child: Icon(
+                              selected
+                                  ? Icons.check_circle
+                                  : Icons.circle_outlined,
+                              size: 22,
+                              color: selected
+                                  ? AppTheme.accent
+                                  : AppTheme.ink.withValues(alpha: 0.35),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Text(
+                    entry.name,
+                    maxLines: 2,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w600,
+                      height: 1.2,
+                    ),
+                  ),
+                  Text(
+                    entry.isDir ? kind.label : formatBytes(entry.size),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      color: AppTheme.ink.withValues(alpha: 0.45),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
         );
       },
     );

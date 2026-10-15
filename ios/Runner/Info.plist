@@ -59,6 +59,18 @@
 	<string>用于将接收的图片和视频保存到相册</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>用于语音通话时采集麦克风音频</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>File2File 通过本地网络与电脑、其他手机或个人网盘建立点对点加密连接。</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_http._tcp</string>
+		<string>_https._tcp</string>
+	</array>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
 		<string>UIInterfaceOrientationPortrait</string>
