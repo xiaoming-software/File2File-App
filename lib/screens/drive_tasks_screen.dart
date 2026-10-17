@@ -65,6 +65,15 @@ class DriveTasksScreen extends StatelessWidget {
   }
 }
 
+String _elapsed(DriveTransfer task) {
+  final started = task.startedAt;
+  if (started == null) return '';
+  final total = DateTime.now().difference(started).inSeconds;
+  final m = (total ~/ 60).toString().padLeft(2, '0');
+  final s = (total % 60).toString().padLeft(2, '0');
+  return ' · $m:$s';
+}
+
 class _SectionTitle extends StatelessWidget {
   const _SectionTitle(this.text);
   final String text;
@@ -93,6 +102,7 @@ class _TaskCard extends StatelessWidget {
       DriveTransferStatus.queued => '排队中',
       DriveTransferStatus.running =>
         '${(task.progress * 100).toStringAsFixed(0)}%'
+            '${_elapsed(task)}'
             '${task.speedBps > 0 ? ' · ${formatBytes(task.speedBps)}/s' : ''}',
       DriveTransferStatus.done => '已完成',
       DriveTransferStatus.failed => '失败',

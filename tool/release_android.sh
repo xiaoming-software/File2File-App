@@ -9,7 +9,7 @@
 set -euo pipefail
 
 # ======== 发版时只改这里 ========
-VERSION_NAME="1.1.0"
+VERSION_NAME="1.1.1"
 # =================================
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"

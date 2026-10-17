@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
+import 'dart:isolate';
 import 'dart:typed_data';
 
 import 'package:ffi/ffi.dart';
@@ -198,6 +199,23 @@ class WebrpcService {
     } finally {
       malloc.free(pathPtr);
     }
+  }
+
+  /// SendFile on a helper isolate so the callback socket can still deliver
+  /// backPut progress on the UI isolate.
+  Future<bool> sendFileAsync(int sessionId, String filePath) async {
+    _ensureOnline();
+    final handle = _handle;
+    final path = filePath;
+    return Isolate.run(() {
+      final bindings = WebrpcBindings.load();
+      final pathPtr = path.toNativeUtf8();
+      try {
+        return bindings.sendFile(handle, sessionId, pathPtr) == 1;
+      } finally {
+        malloc.free(pathPtr);
+      }
+    });
   }
 
   void _ensureOnline() {

@@ -10,6 +10,25 @@ import '../models/drive_models.dart';
 import 'drive_store.dart';
 import 'webrpc_service.dart';
 
+class _PutAck {
+  _PutAck({
+    required this.written,
+    required this.size,
+    required this.ok,
+    required this.error,
+  });
+  final int written;
+  final int size;
+  final bool ok;
+  final String error;
+}
+
+class _ListWait {
+  _ListWait(this.path, this.done);
+  final String path;
+  final Completer<List<NasEntry>> done;
+}
+
 class _RecvFile {
   _RecvFile({
     required this.transferId,
@@ -39,6 +58,8 @@ class DriveController extends ChangeNotifier {
   bool loading = false;
 
   final Map<int, String> _pendingListPath = {};
+  final Map<int, Completer<_PutAck>> _putWait = {};
+  final Map<int, _ListWait> _verifyList = {};
   final Map<String, _RecvFile> _recv = {};
   final Map<String, Completer<bool>> _opWait = {};
   final Map<String, Future<void>> _chunkWriteChain = {};
@@ -715,26 +736,18 @@ class DriveController extends ChangeNotifier {
     final tmpDir = await _store.downloadDir(_ownerToken, session.peerToken);
     final tmp = File(p.join(tmpDir.path, '.$safe.edit'));
     await tmp.writeAsString(text, flush: true);
-    final size = await tmp.length();
-    final announced = _webrpc.sendJson(
-      session.rpcSessionId,
-      {
-        'type': 'putFile',
-        'fileName': safe,
-        'filePath': normalizeNasPath(remoteDir),
-        'size': size,
-      },
-      timeoutMs: 15000,
-    );
-    if (!announced) throw StateError('保存失败');
-    await Future<void>.delayed(const Duration(milliseconds: 80));
-    final ok = size == 0
-        ? true
-        : await Future<bool>(() => _webrpc.sendFile(session.rpcSessionId, tmp.path));
     try {
-      await tmp.delete();
-    } catch (_) {}
-    if (!ok) throw StateError('保存失败');
+      await _putLocalFile(
+        session,
+        localPath: tmp.path,
+        name: safe,
+        remoteDir: normalizeNasPath(remoteDir),
+      );
+    } finally {
+      try {
+        await tmp.delete();
+      } catch (_) {}
+    }
     if (normalizeNasPath(remoteDir) == session.currentPath) {
       await refresh(session);
     }
@@ -968,34 +981,18 @@ class DriveController extends ChangeNotifier {
       if (path.isEmpty || !await File(path).exists()) {
         throw StateError('本地文件不存在');
       }
-      final size = await File(path).length();
-      t.size = size;
-      final announced = _webrpc.sendJson(
-        session.rpcSessionId,
-        {
-          'type': 'putFile',
-          'fileName': t.name,
-          'filePath': t.remoteDir,
-          'size': size,
-        },
-        timeoutMs: 15000,
+      await _putLocalFile(
+        session,
+        localPath: path,
+        name: t.name,
+        remoteDir: t.remoteDir,
+        task: t,
       );
-      if (!announced) throw StateError('上传宣告失败');
-      await Future<void>.delayed(const Duration(milliseconds: 80));
-      if (size == 0) {
-        t.transferred = 0;
-        t.status = DriveTransferStatus.done;
-      } else {
-        final ok = await Future<bool>(
-          () => _webrpc.sendFile(session.rpcSessionId, path),
-        );
-        if (!ok) throw StateError('SendFile 失败');
-        t.transferred = size;
-        t.status = DriveTransferStatus.done;
-        final elapsed =
-            DateTime.now().difference(t.startedAt!).inMilliseconds.clamp(1, 1 << 30);
-        t.speedBps = size * 1000 ~/ elapsed;
-      }
+      t.transferred = t.size;
+      t.status = DriveTransferStatus.done;
+      final elapsed =
+          DateTime.now().difference(t.startedAt ?? DateTime.now()).inMilliseconds.clamp(1, 1 << 30);
+      t.speedBps = t.size * 1000 ~/ elapsed;
       notifyListeners();
       if (t.remoteDir == session.currentPath) {
         await refresh(session);
@@ -1139,6 +1136,9 @@ class DriveController extends ChangeNotifier {
       case 'backPath':
         _onBackPath(session, json);
         break;
+      case 'backPut':
+        _onBackPut(session, json);
+        break;
       case 'backThumb':
         unawaited(_onBackThumb(session, json));
         break;
@@ -1202,29 +1202,72 @@ class DriveController extends ChangeNotifier {
     _opWait.clear();
   }
 
+  void _onBackPut(DriveSession session, Map<String, dynamic> json) {
+    final written = _jsonInt(json['written']);
+    final size = _jsonInt(json['size']);
+    final done = json['done'] == true;
+    final ok = json['ok'] == true;
+    final error = '${json['error'] ?? ''}';
+    for (final t in session.transfers) {
+      if (t.kind != DriveTransferKind.upload ||
+          t.status != DriveTransferStatus.running) {
+        continue;
+      }
+      if (size > 0) t.size = size;
+      t.transferred = written;
+      final started = t.startedAt;
+      if (started != null && written > 0) {
+        final ms = DateTime.now().difference(started).inMilliseconds.clamp(1, 1 << 30);
+        t.speedBps = written * 1000 ~/ ms;
+      }
+      break;
+    }
+    if (done) {
+      final c = _putWait.remove(session.rpcSessionId);
+      if (c != null && !c.isCompleted) {
+        c.complete(
+          _PutAck(written: written, size: size, ok: ok, error: error),
+        );
+      }
+    }
+    notifyListeners();
+  }
+
   void _onBackPath(DriveSession session, Map<String, dynamic> json) {
     final reported = '${json['path'] ?? ''}';
-    final queued = _pendingListPath.remove(session.rpcSessionId);
+    final queued = _pendingListPath[session.rpcSessionId];
     final path = reported.trim().isEmpty
         ? (queued ?? session.currentPath)
         : normalizeNasPath(reported);
     final data = json['data'];
-    final entries = <NasEntry>[];
+    final listed = <NasEntry>[];
     if (data is Map) {
       data.forEach((key, value) {
         final name = '$key';
-        if (name.isEmpty || name.startsWith('.')) return;
+        if (name.isEmpty) return;
         if (value is Map) {
-          entries.add(
+          listed.add(
             NasEntry.fromPathItem(name, Map<String, dynamic>.from(value)),
           );
         }
       });
     }
-    entries.sort((a, b) {
+    listed.sort((a, b) {
       if (a.isDir != b.isDir) return a.isDir ? -1 : 1;
       return a.name.toLowerCase().compareTo(b.name.toLowerCase());
     });
+    final entries = listed.where((e) => !e.name.startsWith('.')).toList();
+    final verify = _verifyList[session.rpcSessionId];
+    if (verify != null && verify.path == path) {
+      _verifyList.remove(session.rpcSessionId);
+      if (!verify.done.isCompleted) verify.done.complete(listed);
+    }
+    final queuedPath = queued == null ? null : normalizeNasPath(queued);
+    final matchesQueued =
+        queuedPath != null && (reported.trim().isEmpty || path == queuedPath);
+    if (matchesQueued) _pendingListPath.remove(session.rpcSessionId);
+    final forUi = matchesQueued || (queuedPath == null && path == session.currentPath);
+    if (!forUi) return;
     session.currentPath = path;
     session.entries = entries;
     session.listing = false;
@@ -1232,6 +1275,152 @@ class DriveController extends ChangeNotifier {
     notifyListeners();
     // Prefetch thumbs for media in this directory (server generates/caches).
     ensureThumbs(session, entries);
+  }
+
+  Future<void> _putLocalFile(
+    DriveSession session, {
+    required String localPath,
+    required String name,
+    required String remoteDir,
+    DriveTransfer? task,
+  }) async {
+    final size = await File(localPath).length();
+    final dir = normalizeNasPath(remoteDir);
+    final rpc = session.rpcSessionId;
+    if (task != null) {
+      task.size = size;
+      task.transferred = 0;
+      notifyListeners();
+    }
+    final ackWait = Completer<_PutAck>();
+    _putWait[rpc] = ackWait;
+    final announced = _webrpc.sendJson(
+      rpc,
+      {
+        'type': 'putFile',
+        'fileName': name,
+        'filePath': dir,
+        'size': size,
+      },
+      timeoutMs: 15000,
+    );
+    if (!announced) {
+      _putWait.remove(rpc);
+      throw StateError('上传宣告失败');
+    }
+    Timer? tick;
+    if (task != null) {
+      tick = Timer.periodic(const Duration(milliseconds: 500), (_) {
+        final started = task.startedAt;
+        if (started != null && task.transferred > 0) {
+          final ms = DateTime.now().difference(started).inMilliseconds.clamp(1, 1 << 30);
+          task.speedBps = task.transferred * 1000 ~/ ms;
+        }
+        notifyListeners();
+      });
+    }
+    try {
+      if (size > 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 80));
+        await _webrpc.sendFileAsync(rpc, localPath);
+      }
+    } finally {
+      tick?.cancel();
+    }
+    final ack = ackWait.isCompleted
+        ? await ackWait.future
+        : await ackWait.future.timeout(
+            const Duration(seconds: 30),
+            onTimeout: () {
+              _putWait.remove(rpc);
+              return _PutAck(
+                written: task?.transferred ?? 0,
+                size: size,
+                ok: false,
+                error: '上传未确认完成',
+              );
+            },
+          );
+    if (!ack.ok || ack.written != size) {
+      await _deleteRemoteQuiet(session, dir, name);
+      final why = ack.error.isEmpty ? '字节数不一致' : ack.error;
+      throw StateError('上传校验失败: $why');
+    }
+    Object? listErr;
+    for (var i = 0; i < 4; i++) {
+      if (i > 0) {
+        await Future<void>.delayed(const Duration(milliseconds: 400));
+      }
+      try {
+        final listed = await _listedSize(session, dir, name);
+        if (listed == size) {
+          if (task != null) task.transferred = size;
+          return;
+        }
+        listErr = StateError('目录大小 $listed 与本地 $size 不一致');
+      } catch (e) {
+        listErr = e;
+      }
+    }
+    final msg = '$listErr';
+    if (!msg.contains('超时')) {
+      await _deleteRemoteQuiet(session, dir, name);
+    }
+    throw StateError('目录核对失败: $msg');
+  }
+
+  Future<int> _listedSize(DriveSession session, String dir, String name) async {
+    final rpc = session.rpcSessionId;
+    final wait = Completer<List<NasEntry>>();
+    _verifyList[rpc] = _ListWait(dir, wait);
+    final ok = _webrpc.sendJson(
+      rpc,
+      {'type': 'getPath', 'data': dir},
+      timeoutMs: 15000,
+    );
+    if (!ok) {
+      _verifyList.remove(rpc);
+      throw StateError('目录核对超时');
+    }
+    final entries = await wait.future.timeout(
+      const Duration(seconds: 20),
+      onTimeout: () {
+        _verifyList.remove(rpc);
+        throw StateError('目录核对超时');
+      },
+    );
+    for (final entry in entries) {
+      if (!entry.isDir && entry.name == name) return entry.size;
+    }
+    throw StateError('目录中没有该文件');
+  }
+
+  Future<void> _deleteRemoteQuiet(DriveSession session, String dir, String name) async {
+    final key = 'delete:${session.rpcSessionId}:$dir';
+    final c = Completer<bool>();
+    _opWait[key] = c;
+    final ok = _webrpc.sendJson(
+      session.rpcSessionId,
+      {
+        'type': 'deleteFile',
+        'fileNames': [name],
+        'filePath': dir,
+      },
+      timeoutMs: 15000,
+    );
+    if (!ok) {
+      _opWait.remove(key);
+      return;
+    }
+    try {
+      await c.future.timeout(const Duration(seconds: 20), onTimeout: () => false);
+    } catch (_) {}
+  }
+
+  int _jsonInt(dynamic v) {
+    if (v is num) return v.toInt();
+    if (v is String) return int.tryParse(v.trim()) ?? 0;
+    return 0;
   }
 
   Future<void> _drainChunkWrites(String key) async {
