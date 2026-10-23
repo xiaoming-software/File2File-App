@@ -4,8 +4,10 @@ import 'package:provider/provider.dart';
 import '../models/drive_models.dart';
 import '../services/drive_controller.dart';
 import '../theme/app_theme.dart';
+import '../utils/webrpc_qr.dart';
 import '../widgets/connection_form_sheet.dart';
 import 'drive_browser_screen.dart';
+import 'peer_qr_scan_screen.dart';
 
 class DrivesTab extends StatelessWidget {
   const DrivesTab({super.key});
@@ -305,6 +307,23 @@ class _CreateDriveSheetState extends State<_CreateDriveSheet> {
     super.dispose();
   }
 
+  Future<void> _scanPeerQr() async {
+    final result = await Navigator.of(context).push<PeerQrCredentials>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => const PeerQrScanScreen(),
+      ),
+    );
+    if (!mounted || result == null) return;
+    setState(() {
+      _token.text = result.token;
+      _pass.text = result.permission;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已填入网盘 Token 与口令')),
+    );
+  }
+
   void _submit() {
     final token = _token.text.trim();
     if (token.isEmpty) {
@@ -329,10 +348,24 @@ class _CreateDriveSheetState extends State<_CreateDriveSheet> {
     return ConnectionFormSheet(
       icon: Icons.cloud_rounded,
       title: '新建网盘',
-      subtitle: '连接 mywebdisk-server；Token 须与当前登录账号不同',
+      subtitle: '扫一扫或手动填写；Token 须与当前登录账号不同',
       primaryLabel: _connectNow ? '创建并连接' : '创建',
       onPrimary: _submit,
       children: [
+        OutlinedButton.icon(
+          onPressed: _scanPeerQr,
+          icon: const Icon(Icons.qr_code_scanner_rounded, size: 20),
+          label: const Text('扫一扫填入'),
+          style: OutlinedButton.styleFrom(
+            foregroundColor: AppTheme.accent,
+            side: BorderSide(color: AppTheme.accent.withValues(alpha: 0.35)),
+            minimumSize: const Size.fromHeight(44),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
         FormFieldBlock(
           label: '网盘 Token',
           controller: _token,

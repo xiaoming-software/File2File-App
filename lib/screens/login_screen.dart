@@ -7,6 +7,7 @@ import 'package:url_launcher/url_launcher.dart';
 import '../models/account.dart';
 import '../services/auth_controller.dart';
 import '../theme/app_theme.dart';
+import 'login_qr_scan_screen.dart';
 
 class LoginScreen extends StatefulWidget {
   const LoginScreen({super.key});
@@ -56,6 +57,25 @@ class _LoginScreenState extends State<LoginScreen> {
         const SnackBar(content: Text('无法打开浏览器')),
       );
     }
+  }
+
+  Future<void> _scanLoginQr() async {
+    final auth = context.read<AuthController>();
+    if (auth.busy) return;
+    final result = await Navigator.of(context).push<LoginQrCredentials>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => const LoginQrScanScreen(),
+      ),
+    );
+    if (!mounted || result == null) return;
+    setState(() {
+      _tokenCtrl.text = result.token;
+      _passwordCtrl.text = result.password;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已填入 Token 与密码，请确认口令后登录')),
+    );
   }
 
   Future<void> _submitLogin() async {
@@ -144,55 +164,77 @@ class _LoginScreenState extends State<LoginScreen> {
               ],
             ),
           ),
-          child: SafeArea(
-            child: LayoutBuilder(
-              builder: (context, constraints) {
-                return SingleChildScrollView(
-                  padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 16),
-                  child: ConstrainedBox(
-                    constraints: BoxConstraints(minHeight: constraints.maxHeight - 32),
-                    child: Column(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        _BrandBlock(webrpcTap: _webrpcTap),
-                        const SizedBox(height: 22),
-                        ConstrainedBox(
-                          constraints: const BoxConstraints(maxWidth: 400),
-                          child: _LoginCard(
-                            tokenCtrl: _tokenCtrl,
-                            passwordCtrl: _passwordCtrl,
-                            passphraseCtrl: _passphraseCtrl,
-                            obscurePassword: _obscurePassword,
-                            remember: _remember,
-                            busy: auth.busy,
-                            registerRemaining: auth.registerRemaining,
-                            errorMessage: auth.errorMessage,
-                            progressMessage: auth.progressMessage,
-                            onToggleObscure: () => setState(
-                              () => _obscurePassword = !_obscurePassword,
+          child: Stack(
+            children: [
+              SafeArea(
+                child: LayoutBuilder(
+                  builder: (context, constraints) {
+                    return SingleChildScrollView(
+                      padding: const EdgeInsets.symmetric(horizontal: 22, vertical: 16),
+                      child: ConstrainedBox(
+                        constraints: BoxConstraints(minHeight: constraints.maxHeight - 32),
+                        child: Column(
+                          mainAxisAlignment: MainAxisAlignment.center,
+                          children: [
+                            _BrandBlock(webrpcTap: _webrpcTap),
+                            const SizedBox(height: 22),
+                            ConstrainedBox(
+                              constraints: const BoxConstraints(maxWidth: 400),
+                              child: _LoginCard(
+                                tokenCtrl: _tokenCtrl,
+                                passwordCtrl: _passwordCtrl,
+                                passphraseCtrl: _passphraseCtrl,
+                                obscurePassword: _obscurePassword,
+                                remember: _remember,
+                                busy: auth.busy,
+                                registerRemaining: auth.registerRemaining,
+                                errorMessage: auth.errorMessage,
+                                progressMessage: auth.progressMessage,
+                                onToggleObscure: () => setState(
+                                  () => _obscurePassword = !_obscurePassword,
+                                ),
+                                onRemember: (v) => setState(() => _remember = v),
+                                onLogin: _submitLogin,
+                                onOneClick: _oneClick,
+                              ),
                             ),
-                            onRemember: (v) => setState(() => _remember = v),
-                            onLogin: _submitLogin,
-                            onOneClick: _oneClick,
-                          ),
+                            if (showSaved) ...[
+                              const SizedBox(height: 18),
+                              ConstrainedBox(
+                                constraints: const BoxConstraints(maxWidth: 400),
+                                child: _SavedAccounts(
+                                  accounts: auth.savedAccounts,
+                                  enabled: !auth.busy,
+                                  onTap: _loginSaved,
+                                ),
+                              ),
+                            ],
+                          ],
                         ),
-                        if (showSaved) ...[
-                          const SizedBox(height: 18),
-                          ConstrainedBox(
-                            constraints: const BoxConstraints(maxWidth: 400),
-                            child: _SavedAccounts(
-                              accounts: auth.savedAccounts,
-                              enabled: !auth.busy,
-                              onTap: _loginSaved,
-                            ),
-                          ),
-                        ],
-                      ],
+                      ),
+                    );
+                  },
+                ),
+              ),
+              // 大厂常见：登录页右上角「扫一扫」
+              SafeArea(
+                child: Align(
+                  alignment: Alignment.topRight,
+                  child: Padding(
+                    padding: const EdgeInsets.only(right: 6, top: 2),
+                    child: IconButton(
+                      tooltip: '扫一扫',
+                      onPressed: auth.busy ? null : _scanLoginQr,
+                      icon: Icon(
+                        Icons.qr_code_scanner_rounded,
+                        size: 26,
+                        color: AppTheme.ink.withValues(alpha: auth.busy ? 0.28 : 0.75),
+                      ),
                     ),
                   ),
-                );
-              },
-            ),
+                ),
+              ),
+            ],
           ),
         ),
       ),

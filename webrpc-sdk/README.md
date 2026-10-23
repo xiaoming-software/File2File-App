@@ -3,8 +3,12 @@
 | 平台 | 文件 | 架构 |
 |------|------|------|
 | Android | `libwebrpc-Android.so` | arm64-v8a |
+| Android | `libwebrpc-Android-armeabi-v7a.so` | armeabi-v7a（arm32） |
 | iOS 真机 | `libwebrpc-ios.a` | arm64（iphoneos） |
 | iOS 模拟器 | `libwebrpc-ios-simulator.a` | arm64（iphonesimulator） |
 
-Flutter 工程会把 Android `.so` 拷到 `android/app/src/main/jniLibs/arm64-v8a/libwebrpc.so`，
+Flutter 工程把 Android `.so` 拷到：
+- `android/app/src/main/jniLibs/arm64-v8a/libwebrpc.so`
+- `android/app/src/main/jniLibs/armeabi-v7a/libwebrpc.so`
+
 iOS 通过 `ios/Flutter/*.xcconfig` 按 SDK 选择对应静态库。

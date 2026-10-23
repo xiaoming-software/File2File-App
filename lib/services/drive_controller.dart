@@ -37,8 +37,12 @@ class _RecvFile {
   });
   final String transferId;
   final String path;
-  final int size;
+  int size;
   int bytes = 0;
+  /// NAS `backFile` arrived. webrpc is async: chunks may still be in flight.
+  bool endSignaled = false;
+  /// Bumped to cancel an in-flight settle loop when recv is replaced/cancelled.
+  int settleEpoch = 0;
 }
 
 /// Personal drive (mywebdisk-server) over webrpc string-typed NAS messages.
@@ -706,9 +710,14 @@ class DriveController extends ChangeNotifier {
     t.cancelRequested = true;
     t.error = '已取消';
     String? recvKey;
+    _RecvFile? recv;
     _recv.forEach((k, v) {
-      if (v.transferId == t.id) recvKey = k;
+      if (v.transferId == t.id) {
+        recvKey = k;
+        recv = v;
+      }
     });
+    if (recv != null) recv!.settleEpoch++;
     if (recvKey != null) _recv.remove(recvKey);
     final c = _opWait.remove('dl:${t.id}');
     if (c != null && !c.isCompleted) c.complete(false);
@@ -1080,7 +1089,8 @@ class DriveController extends ChangeNotifier {
         return;
       }
       if (!success && t.status != DriveTransferStatus.done) {
-        throw StateError('下载超时或失败');
+        final detail = t.error.trim();
+        throw StateError(detail.isEmpty ? '下载超时或失败' : detail);
       }
       if (t.status == DriveTransferStatus.running) {
         t.status = DriveTransferStatus.done;
@@ -1436,31 +1446,7 @@ class DriveController extends ChangeNotifier {
     }
   }
 
-  Future<void> _onBackFile(DriveSession session, Map<String, dynamic> json) async {
-    final name = safeFileName('${json['fileName'] ?? ''}');
-    if (name.isEmpty) return;
-    final key = '${session.rpcSessionId}::$name';
-
-    // Yield so already-dispatched chunk listeners can register on the write chain
-    // before we finalize (critical for tiny txt/mp3 where backFile follows immediately).
-    await Future<void>.delayed(const Duration(milliseconds: 20));
-    await _drainChunkWrites(key);
-
-    final recv = _recv.remove(key);
-    if (recv == null) {
-      notifyListeners();
-      return;
-    }
-
-    // One more drain in case a chunk registered during remove.
-    await _drainChunkWrites(key);
-
-    final t = transferById(session, recv.transferId);
-    if (t == null) {
-      notifyListeners();
-      return;
-    }
-
+  Future<int> _recvLocalBytes(_RecvFile recv) async {
     var bytes = recv.bytes;
     try {
       final f = File(recv.path);
@@ -1469,19 +1455,64 @@ class DriveController extends ChangeNotifier {
         if (len > bytes) bytes = len;
       }
     } catch (_) {}
+    return bytes;
+  }
 
+  int _recvSettleSeconds(_RecvFile recv) {
+    // Mirror Desktop wait_for_nas_cache (90s+) and App download wait:
+    // backFile is only "peer finished sending", not "local file complete".
+    if (recv.size > 0) {
+      return (recv.size / 1024).clamp(90, 3600).toInt();
+    }
+    return 90;
+  }
+
+  /// Finalize a download recv slot. Safe if already completed / cancelled.
+  Future<void> _finalizeRecv(
+    DriveSession session,
+    String key, {
+    required bool ok,
+    String error = '',
+  }) async {
+    await _drainChunkWrites(key);
+    final recv = _recv.remove(key);
+    if (recv == null) return;
+
+    await _drainChunkWrites(key);
+
+    final t = transferById(session, recv.transferId);
+    if (t == null) {
+      notifyListeners();
+      return;
+    }
+
+    final bytes = await _recvLocalBytes(recv);
+    recv.bytes = bytes;
     t.transferred = bytes;
     t.localPath = recv.path;
     if (t.size <= 0 && bytes > 0) t.size = bytes;
+    if (recv.size > 0 && t.size < recv.size) t.size = recv.size;
 
     if (t.cancelRequested || t.status == DriveTransferStatus.cancelled) {
       t.status = DriveTransferStatus.cancelled;
       t.error = '已取消';
-    } else if (bytes <= 0 && t.size > 0) {
+    } else if (!ok) {
+      t.status = DriveTransferStatus.failed;
+      if (error.isNotEmpty) {
+        t.error = error;
+      } else if (bytes <= 0) {
+        t.error = '未收到文件数据（0 字节）';
+      } else if (recv.size > 0 && bytes < recv.size) {
+        t.error = '下载未收齐（$bytes / ${recv.size}）';
+      } else {
+        t.error = '下载失败';
+      }
+    } else if (bytes <= 0 && recv.size > 0) {
       t.status = DriveTransferStatus.failed;
       t.error = '未收到文件数据（0 字节）';
     } else {
       t.status = DriveTransferStatus.done;
+      t.error = '';
     }
 
     if (t.startedAt != null && bytes > 0) {
@@ -1494,6 +1525,106 @@ class DriveController extends ChangeNotifier {
       c.complete(t.status == DriveTransferStatus.done);
     }
     notifyListeners();
+  }
+
+  /// After `backFile`: poll local cache until size matches or length stabilizes.
+  /// Same idea as Desktop `wait_for_nas_cache` — never treat end signal as data done.
+  Future<void> _settleRecvAfterBackFile(DriveSession session, String key) async {
+    final recv = _recv[key];
+    if (recv == null) return;
+    recv.endSignaled = true;
+    final epoch = ++recv.settleEpoch;
+    final deadline =
+        DateTime.now().add(Duration(seconds: _recvSettleSeconds(recv)));
+
+    var lastLen = -1;
+    var stable = 0;
+
+    while (DateTime.now().isBefore(deadline)) {
+      if (recv.settleEpoch != epoch) return;
+      if (!identical(_recv[key], recv)) return;
+
+      final t = transferById(session, recv.transferId);
+      if (t == null ||
+          t.cancelRequested ||
+          t.status == DriveTransferStatus.cancelled) {
+        return;
+      }
+
+      await _drainChunkWrites(key);
+      if (!identical(_recv[key], recv)) return;
+
+      final bytes = await _recvLocalBytes(recv);
+      recv.bytes = bytes;
+      t.transferred = bytes;
+      t.localPath = recv.path;
+      if (recv.size > 0) t.size = recv.size;
+      if (t.startedAt != null && bytes > 0) {
+        final elapsed = DateTime.now()
+            .difference(t.startedAt!)
+            .inMilliseconds
+            .clamp(1, 1 << 30);
+        t.speedBps = bytes * 1000 ~/ elapsed;
+      }
+      notifyListeners();
+
+      final expected = recv.size > 0 ? recv.size : t.size;
+      if (expected > 0 && bytes >= expected) {
+        await _finalizeRecv(session, key, ok: true);
+        return;
+      }
+
+      // Unknown size: require length to stay stable (~800ms), like Desktop.
+      if (expected <= 0) {
+        if (bytes > 0 && bytes == lastLen) {
+          stable += 1;
+          if (stable >= 8) {
+            await _finalizeRecv(session, key, ok: true);
+            return;
+          }
+        } else {
+          stable = 0;
+          lastLen = bytes;
+        }
+      }
+
+      await Future<void>.delayed(const Duration(milliseconds: 100));
+    }
+
+    if (recv.settleEpoch != epoch || !identical(_recv[key], recv)) return;
+    final bytes = await _recvLocalBytes(recv);
+    final expected = recv.size > 0 ? recv.size : 0;
+    final ok = expected > 0 ? bytes >= expected : bytes > 0;
+    await _finalizeRecv(
+      session,
+      key,
+      ok: ok,
+      error: ok
+          ? ''
+          : (expected > 0
+              ? '下载未收齐（$bytes / $expected）'
+              : '下载超时或失败'),
+    );
+  }
+
+  Future<void> _onBackFile(DriveSession session, Map<String, dynamic> json) async {
+    final name = safeFileName('${json['fileName'] ?? ''}');
+    if (name.isEmpty) return;
+    final key = '${session.rpcSessionId}::$name';
+
+    // Yield so already-dispatched chunk listeners can register on the write chain.
+    await Future<void>.delayed(const Duration(milliseconds: 20));
+    await _drainChunkWrites(key);
+
+    final recv = _recv[key];
+    if (recv == null) {
+      // Chunks may have already completed by size match; nothing left to settle.
+      notifyListeners();
+      return;
+    }
+
+    // Do NOT finalize here — SendFile/backFile can outrun P2P chunk delivery.
+    unawaited(_settleRecvAfterBackFile(session, key));
   }
 
   void _onBackSearch(DriveSession session, Map<String, dynamic> json) {
@@ -1539,6 +1670,7 @@ class DriveController extends ChangeNotifier {
       final t = transferById(session, recv.transferId);
       if (t != null &&
           (t.cancelRequested || t.status == DriveTransferStatus.cancelled)) {
+        recv.settleEpoch++;
         _recv.remove(key);
         final c = _opWait.remove('dl:${t.id}');
         if (c != null && !c.isCompleted) c.complete(false);
@@ -1563,8 +1695,11 @@ class DriveController extends ChangeNotifier {
               .clamp(1, 1 << 30);
           t.speedBps = recv.bytes * 1000 ~/ elapsed;
         }
+        // Size known and fully written: finish without waiting for backFile.
         if (recv.size > 0 && recv.bytes >= recv.size) {
+          recv.settleEpoch++;
           t.status = DriveTransferStatus.done;
+          t.error = '';
           _recv.remove(key);
           final c = _opWait.remove('dl:${t.id}');
           if (c != null && !c.isCompleted) c.complete(true);

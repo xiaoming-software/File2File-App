@@ -29,9 +29,9 @@ android {
         targetSdk = flutter.targetSdkVersion
         versionCode = flutter.versionCode
         versionName = flutter.versionName
-        // webrpc Android SDK currently ships arm64-v8a only.
+        // webrpc: arm64-v8a + armeabi-v7a（见 jniLibs/）
         ndk {
-            abiFilters += listOf("arm64-v8a")
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a")
         }
     }
 

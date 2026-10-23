@@ -1,13 +1,17 @@
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
+import 'package:qr_flutter/qr_flutter.dart';
 
 import '../models/chat_models.dart';
 import '../services/auth_controller.dart';
 import '../services/chat_controller.dart';
 import '../theme/app_theme.dart';
+import '../utils/webrpc_qr.dart';
 import '../widgets/connection_form_sheet.dart';
 import 'chat_screen.dart';
+import 'peer_qr_enlarge_screen.dart';
+import 'peer_qr_scan_screen.dart';
 
 class SessionsTab extends StatelessWidget {
   const SessionsTab({super.key});
@@ -239,30 +243,150 @@ class _MyConnectionCard extends StatelessWidget {
               ),
             ),
             const SizedBox(height: 10),
-            _CopyRow(
-              label: 'Token',
-              value: token.isEmpty ? '—' : _ellipsize(token),
-              dimmed: token.isEmpty,
-              onCopy: () => _copy(
-                context,
-                token,
-                token.isEmpty ? 'Token 为空' : '已复制 Token',
-              ),
-            ),
-            const SizedBox(height: 6),
-            _CopyRow(
-              label: '口令',
-              value: passphrase.isEmpty
-                  ? '未设置'
-                  : _ellipsize(passphrase, head: 8, tail: 2),
-              dimmed: passphrase.isEmpty,
-              onCopy: () => _copy(
-                context,
-                passphrase,
-                passphrase.isEmpty ? '已复制空口令' : '已复制认证口令',
-              ),
+            Row(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Expanded(
+                  child: Column(
+                    children: [
+                      _CopyRow(
+                        label: 'Token',
+                        value: token.isEmpty ? '—' : _ellipsize(token),
+                        dimmed: token.isEmpty,
+                        onCopy: () => _copy(
+                          context,
+                          token,
+                          token.isEmpty ? 'Token 为空' : '已复制 Token',
+                        ),
+                      ),
+                      const SizedBox(height: 6),
+                      _CopyRow(
+                        label: '口令',
+                        value: passphrase.isEmpty
+                            ? '未设置'
+                            : _ellipsize(passphrase, head: 8, tail: 2),
+                        dimmed: passphrase.isEmpty,
+                        onCopy: () => _copy(
+                          context,
+                          passphrase,
+                          passphrase.isEmpty ? '已复制空口令' : '已复制认证口令',
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(width: 10),
+                _MyPeerQrThumb(
+                  token: token,
+                  passphrase: passphrase,
+                ),
+              ],
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+class _MyPeerQrThumb extends StatelessWidget {
+  const _MyPeerQrThumb({
+    required this.token,
+    required this.passphrase,
+  });
+
+  final String token;
+  final String passphrase;
+
+  bool get _ready => token.isNotEmpty && passphrase.trim().isNotEmpty;
+
+  void _open(BuildContext context) {
+    if (!_ready) {
+      ScaffoldMessenger.of(context).hideCurrentSnackBar();
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('请先设置认证口令后再生成二维码')),
+      );
+      return;
+    }
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => PeerQrEnlargeScreen(
+          token: token,
+          permission: passphrase,
+        ),
+      ),
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final payload = _ready
+        ? encodePeerQr(token: token, permission: passphrase)
+        : null;
+
+    return Material(
+      color: Colors.white,
+      borderRadius: BorderRadius.circular(12),
+      child: InkWell(
+        onTap: () => _open(context),
+        borderRadius: BorderRadius.circular(12),
+        child: Container(
+          width: 86,
+          padding: const EdgeInsets.fromLTRB(6, 6, 6, 8),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(12),
+            border: Border.all(
+              color: _ready
+                  ? AppTheme.accent.withValues(alpha: 0.28)
+                  : AppTheme.ink.withValues(alpha: 0.08),
+            ),
+          ),
+          child: Column(
+            children: [
+              SizedBox(
+                width: 72,
+                height: 72,
+                child: _ready
+                    ? QrImageView(
+                        data: payload!,
+                        version: QrVersions.auto,
+                        size: 72,
+                        padding: EdgeInsets.zero,
+                        backgroundColor: Colors.white,
+                        eyeStyle: const QrEyeStyle(
+                          eyeShape: QrEyeShape.square,
+                          color: Color(0xFF0B6E4F),
+                        ),
+                        dataModuleStyle: const QrDataModuleStyle(
+                          dataModuleShape: QrDataModuleShape.square,
+                          color: Color(0xFF12241C),
+                        ),
+                      )
+                    : ColoredBox(
+                        color: AppTheme.mist.withValues(alpha: 0.85),
+                        child: Center(
+                          child: Icon(
+                            Icons.qr_code_2_rounded,
+                            size: 34,
+                            color: AppTheme.ink.withValues(alpha: 0.28),
+                          ),
+                        ),
+                      ),
+              ),
+              const SizedBox(height: 4),
+              Text(
+                _ready ? '点开扫码' : '先设口令',
+                style: TextStyle(
+                  fontSize: 10.5,
+                  fontWeight: FontWeight.w600,
+                  color: _ready
+                      ? AppTheme.accent
+                      : AppTheme.ink.withValues(alpha: 0.38),
+                ),
+              ),
+            ],
+          ),
         ),
       ),
     );
@@ -614,6 +738,23 @@ class _CreateSessionSheetState extends State<_CreateSessionSheet> {
     super.dispose();
   }
 
+  Future<void> _scanPeerQr() async {
+    final result = await Navigator.of(context).push<PeerQrCredentials>(
+      MaterialPageRoute(
+        fullscreenDialog: true,
+        builder: (_) => const PeerQrScanScreen(),
+      ),
+    );
+    if (!mounted || result == null) return;
+    setState(() {
+      _token.text = result.token;
+      _pass.text = result.permission;
+    });
+    ScaffoldMessenger.of(context).showSnackBar(
+      const SnackBar(content: Text('已填入对方 Token 与口令')),
+    );
+  }
+
   void _submit() {
     final token = _token.text.trim();
     if (token.isEmpty) {
@@ -638,10 +779,24 @@ class _CreateSessionSheetState extends State<_CreateSessionSheet> {
     return ConnectionFormSheet(
       icon: Icons.chat_bubble_rounded,
       title: '新建会话',
-      subtitle: '填写对方 webrpc Token；若对方设置了认证口令也需一并填写',
+      subtitle: '扫一扫对方二维码，或手动填写 Token 与口令',
       primaryLabel: _connectNow ? '创建并连接' : '创建',
       onPrimary: _submit,
       children: [
+        OutlinedButton.icon(
+          onPressed: _scanPeerQr,
+          icon: const Icon(Icons.qr_code_scanner_rounded, size: 20),
+          label: const Text('扫一扫填入'),
+          style: OutlinedButton.styleFrom(
+            foregroundColor: AppTheme.accent,
+            side: BorderSide(color: AppTheme.accent.withValues(alpha: 0.35)),
+            minimumSize: const Size.fromHeight(44),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(12),
+            ),
+          ),
+        ),
+        const SizedBox(height: 12),
         FormFieldBlock(
           label: '对方 Token',
           controller: _token,
