@@ -1,0 +1,37 @@
+【名称】File2File
+【副标题】（30 字内）加密互传与个人网盘
+【类别】建议：工具 / 效率（主），社交（次，可选）
+【价格】免费
+
+【宣传文本】（170 字内，可随时改，不随版本审核）
+手机与电脑、手机与手机加密直连传文件；也可连接家里自建网盘，文件始终留在你自己的磁盘。
+
+【描述】
+File2File 基于 webrpc p2p，把「点对点互传」和「个人网盘」放在同一个 App 里。
+
+• 加密直连传消息与文件，不必先传到公有云
+• 无需公网 IP 或路由器端口映射
+• Token + 认证口令，控制谁能连上你
+• 与 File2File 桌面版互通（Windows / macOS / Linux）
+• 连接自建 mywebdisk，在手机上浏览、上传、下载、整理家里的目录
+
+使用前请在 webrpc.cn 获取 Token，或在登录页使用一键注册（以实际活动为准）。
+
+【关键词】（100 字符内，逗号分隔）
+传文件,P2P,网盘,NAS,加密,文件传输,局域网,webrpc,互传
+
+【支持网址】
+https://github.com/xiaoming-software/File2File-App
+
+【营销网址】（可选）
+https://www.webrpc.cn/
+
+【隐私政策网址】（必须可公网打开，不要用 github.com/.../blob/...）
+https://xiaoming-software.github.io/File2File-App/privacy.html
+（仓库已开 GitHub Pages，源目录 /docs；对应文件 docs/privacy.html）
+
+【审核备注】（给苹果审核员）
+本应用为工具类：使用 webrpc Token 登录后，可与另一台已安装 File2File / 桌面端的设备建立加密连接传文件，或连接用户自建的 mywebdisk 服务。
+演示账号：若审核需要，请说明我们可提供测试 Token；默认可用登录页「一键注册」领取试用 Token（依赖 webrpc 服务可用）。
+不涉及 UGC 社交广场；消息与文件为点对点或用户自建存储。
+使用加密：标准算法（AES/TLS 等）用于传输保护。
