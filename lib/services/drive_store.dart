@@ -86,6 +86,27 @@ class DriveStore {
     }
   }
 
+  /// 删除该 owner 下本机网盘列表与缓存目录。
+  Future<void> wipeOwner(String owner) async {
+    final o = owner.trim();
+    if (o.isEmpty) return;
+    final root = await _root();
+    final list = await _listFile(o);
+    if (await list.exists()) {
+      try {
+        await list.delete();
+      } catch (_) {}
+    }
+    for (final sub in ['files', 'thumbs']) {
+      final dir = Directory(p.join(root.path, sub, _safe(o)));
+      if (await dir.exists()) {
+        try {
+          await dir.delete(recursive: true);
+        } catch (_) {}
+      }
+    }
+  }
+
   String _safe(String raw) {
     final s = raw.trim().replaceAll(RegExp(r'[^a-zA-Z0-9._-]'), '_');
     if (s.isEmpty) return 'unknown';

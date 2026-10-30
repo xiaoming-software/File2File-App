@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:typed_data';
 
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_pcm_sound/flutter_pcm_sound.dart';
 import 'package:opus_dart/opus_dart.dart';
@@ -73,7 +74,7 @@ class VoiceAudioEngine {
     _recorder = recorder;
     final hasMic = await recorder.hasPermission();
     if (!hasMic) {
-      throw StateError('需要麦克风权限才能进行语音通话');
+      throw StateError('需要麦克风权限才能进行语音通话'.tr);
     }
 
     final stream = await recorder.startStream(

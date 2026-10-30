@@ -1,9 +1,14 @@
+import 'dart:async';
+
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../models/drive_models.dart';
+import '../services/auth_controller.dart';
 import '../services/drive_controller.dart';
 import '../theme/app_theme.dart';
+import '../utils/app_snack.dart';
 import '../utils/webrpc_qr.dart';
 import '../widgets/connection_form_sheet.dart';
 import 'drive_browser_screen.dart';
@@ -22,7 +27,7 @@ class DrivesTab extends StatelessWidget {
         heroTag: 'drives-tab-fab',
         onPressed: () => _showCreate(context),
         icon: const Icon(Icons.add),
-        label: const Text('新建网盘'),
+        label: Text('新建网盘'.tr),
       ),
       body: drive.loading
           ? const Center(child: CircularProgressIndicator())
@@ -51,6 +56,37 @@ class DrivesTab extends StatelessWidget {
     );
   }
 
+  void _connectDrive(BuildContext context, DriveSession session) {
+    if (session.connecting || session.connected) return;
+    final auth = context.read<AuthController>();
+    final drive = context.read<DriveController>();
+    unawaited(() async {
+      try {
+        await drive.healAfterForeground(
+          session,
+          ensureWebrpc: ({bool forceRelogin = false}) =>
+              auth.ensureWebrpcAlive(forceRelogin: forceRelogin),
+        );
+        if (!session.connected && context.mounted) {
+          showAppSnack(
+            context,
+            session.connectError.isNotEmpty
+                ? session.connectError
+                : '连接失败，请重试'.tr,
+          );
+        }
+      } catch (e) {
+        if (context.mounted) {
+          showAppSnack(
+            context,
+            session.connectError.isNotEmpty ? session.connectError : e,
+            fallback: '连接失败，请重试'.tr,
+          );
+        }
+      }
+    }());
+  }
+
   Future<void> _showCreate(BuildContext context) async {
     final result = await showModalBottomSheet<_CreateDriveResult>(
       context: context,
@@ -67,7 +103,7 @@ class DrivesTab extends StatelessWidget {
         remark: result.remark,
       );
       if (result.connectNow) {
-        await drive.connect(session);
+        _connectDrive(context, session);
       }
       if (!context.mounted) return;
       await Navigator.of(context).push(
@@ -77,7 +113,7 @@ class DrivesTab extends StatelessWidget {
       );
     } catch (e) {
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      showAppSnack(context, e, fallback: '连接失败，请重试'.tr);
     }
   }
 
@@ -89,20 +125,13 @@ class DrivesTab extends StatelessWidget {
     final drive = context.read<DriveController>();
     switch (action) {
       case 'connect':
-        try {
-          await drive.connect(session);
-        } catch (e) {
-          if (context.mounted) {
-            ScaffoldMessenger.of(context)
-                .showSnackBar(SnackBar(content: Text('$e')));
-          }
-        }
+        _connectDrive(context, session);
       case 'disconnect':
         await drive.disconnect(session);
       case 'remark':
         await _editMeta(context, session);
       case 'delete':
-        final ok = await _confirm(context, '删除该网盘会话？本地下载缓存也会清除。');
+        final ok = await _confirm(context, '删除该网盘会话？本地下载缓存也会清除。'.tr);
         if (ok) await drive.deleteSession(session);
     }
   }
@@ -131,11 +160,11 @@ class DrivesTab extends StatelessWidget {
         actions: [
           TextButton(
             onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('取消'),
+            child: Text('取消'.tr),
           ),
           FilledButton(
             onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('确定'),
+            child: Text('确定'.tr),
           ),
         ],
       ),
@@ -159,7 +188,7 @@ class _Empty extends StatelessWidget {
             Icon(Icons.cloud_outlined, size: 56, color: AppTheme.accent),
             const SizedBox(height: 16),
             Text(
-              '还没有网盘',
+              '还没有网盘'.tr,
               style: Theme.of(context).textTheme.titleMedium?.copyWith(
                     fontWeight: FontWeight.w700,
                     color: AppTheme.ink,
@@ -167,7 +196,7 @@ class _Empty extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             Text(
-              '添加 mywebdisk-server 的 Token 与口令（须与登录 Token 不同）',
+              '添加 mywebdisk-server 的 Token 与口令（须与登录 Token 不同）'.tr,
               textAlign: TextAlign.center,
               style: TextStyle(color: AppTheme.ink.withValues(alpha: 0.55)),
             ),
@@ -175,7 +204,7 @@ class _Empty extends StatelessWidget {
             FilledButton.icon(
               onPressed: onCreate,
               icon: const Icon(Icons.add),
-              label: const Text('新建网盘'),
+              label: Text('新建网盘'.tr),
             ),
           ],
         ),
@@ -203,10 +232,10 @@ class _DriveTile extends StatelessWidget {
             ? Colors.orange
             : AppTheme.ink.withValues(alpha: 0.35);
     final statusText = session.connected
-        ? '已连接'
+        ? '已连接'.tr
         : session.connecting
-            ? '连接中…'
-            : '未连接';
+            ? '连接中…'.tr
+            : '未连接'.tr;
 
     return Material(
       color: Colors.white.withValues(alpha: 0.92),
@@ -258,11 +287,11 @@ class _DriveTile extends StatelessWidget {
                 onSelected: onMenu,
                 itemBuilder: (ctx) => [
                   if (!session.connected)
-                    const PopupMenuItem(value: 'connect', child: Text('连接')),
+                    PopupMenuItem(value: 'connect', child: Text('连接'.tr)),
                   if (session.connected)
-                    const PopupMenuItem(value: 'disconnect', child: Text('断开')),
-                  const PopupMenuItem(value: 'remark', child: Text('备注/口令')),
-                  const PopupMenuItem(value: 'delete', child: Text('删除')),
+                    PopupMenuItem(value: 'disconnect', child: Text('断开'.tr)),
+                  PopupMenuItem(value: 'remark', child: Text('备注/口令'.tr)),
+                  PopupMenuItem(value: 'delete', child: Text('删除'.tr)),
                 ],
               ),
             ],
@@ -320,7 +349,7 @@ class _CreateDriveSheetState extends State<_CreateDriveSheet> {
       _pass.text = result.permission;
     });
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('已填入网盘 Token 与口令')),
+      SnackBar(content: Text('已填入网盘 Token 与口令'.tr)),
     );
   }
 
@@ -328,7 +357,7 @@ class _CreateDriveSheetState extends State<_CreateDriveSheet> {
     final token = _token.text.trim();
     if (token.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请填写网盘 Token')),
+        SnackBar(content: Text('请填写网盘 Token'.tr)),
       );
       return;
     }
@@ -347,15 +376,15 @@ class _CreateDriveSheetState extends State<_CreateDriveSheet> {
   Widget build(BuildContext context) {
     return ConnectionFormSheet(
       icon: Icons.cloud_rounded,
-      title: '新建网盘',
-      subtitle: '扫一扫或手动填写；Token 须与当前登录账号不同',
-      primaryLabel: _connectNow ? '创建并连接' : '创建',
+      title: '新建网盘'.tr,
+      subtitle: '扫一扫或手动填写；Token 须与当前登录账号不同'.tr,
+      primaryLabel: _connectNow ? '创建并连接'.tr : '创建'.tr,
       onPrimary: _submit,
       children: [
         OutlinedButton.icon(
           onPressed: _scanPeerQr,
           icon: const Icon(Icons.qr_code_scanner_rounded, size: 20),
-          label: const Text('扫一扫填入'),
+          label: Text('扫一扫填入'.tr),
           style: OutlinedButton.styleFrom(
             foregroundColor: AppTheme.accent,
             side: BorderSide(color: AppTheme.accent.withValues(alpha: 0.35)),
@@ -367,32 +396,32 @@ class _CreateDriveSheetState extends State<_CreateDriveSheet> {
         ),
         const SizedBox(height: 12),
         FormFieldBlock(
-          label: '网盘 Token',
+          label: '网盘 Token'.tr,
           controller: _token,
-          hint: '粘贴服务器 Token',
+          hint: '粘贴服务器 Token'.tr,
           autofocus: true,
           textCapitalization: TextCapitalization.characters,
           textInputAction: TextInputAction.next,
           onChanged: (_) => setState(() {}),
         ),
         FormFieldBlock(
-          label: '网盘口令',
+          label: '网盘口令'.tr,
           controller: _pass,
-          hint: '对应 --permission 口令',
-          helper: '与服务器启动参数中的 permission 一致',
+          hint: '对应 --permission 口令'.tr,
+          helper: '与服务器启动参数中的 permission 一致'.tr,
           textInputAction: TextInputAction.next,
         ),
         FormFieldBlock(
-          label: '备注名',
+          label: '备注名'.tr,
           controller: _remark,
-          hint: '例如：办公室 NAS',
+          hint: '例如：办公室 NAS'.tr,
           optional: true,
           textInputAction: TextInputAction.done,
         ),
         ConnectNowToggle(
           value: _connectNow,
           onChanged: (v) => setState(() => _connectNow = v),
-          subtitle: '创建后立刻连接并打开目录',
+          subtitle: '创建后立刻连接并打开目录'.tr,
         ),
       ],
     );
@@ -438,25 +467,25 @@ class _EditDriveMetaDialogState extends State<_EditDriveMetaDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('备注 / 口令'),
+      title: Text('备注 / 口令'.tr),
       content: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
           TextField(
             controller: _remark,
-            decoration: const InputDecoration(labelText: '备注'),
+            decoration: InputDecoration(labelText: '备注'.tr),
           ),
           const SizedBox(height: 10),
           TextField(
             controller: _pass,
-            decoration: const InputDecoration(labelText: '网盘口令'),
+            decoration: InputDecoration(labelText: '网盘口令'.tr),
           ),
         ],
       ),
       actions: [
         TextButton(
           onPressed: () => Navigator.pop(context),
-          child: const Text('取消'),
+          child: Text('取消'.tr),
         ),
         FilledButton(
           onPressed: () => Navigator.pop(
@@ -466,7 +495,7 @@ class _EditDriveMetaDialogState extends State<_EditDriveMetaDialog> {
               peerPass: _pass.text,
             ),
           ),
-          child: const Text('保存'),
+          child: Text('保存'.tr),
         ),
       ],
     );

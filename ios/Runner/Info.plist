@@ -56,7 +56,7 @@
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>用于选择相册中的照片和视频发送到会话</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
-	<string>用于将接收的图片和视频保存到相册</string>
+	<string>用于将聊天接收与网盘下载的图片、视频保存到相册</string>
 	<key>NSCameraUsageDescription</key>
 	<string>用于扫描 webrpc 官网登录二维码，自动填入 Token 与密码</string>
 	<key>NSMicrophoneUsageDescription</key>

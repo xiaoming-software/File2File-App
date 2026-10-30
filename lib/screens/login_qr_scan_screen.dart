@@ -1,3 +1,4 @@
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
@@ -48,11 +49,11 @@ class _LoginQrScanScreenState extends State<LoginQrScanScreen> {
       if (raw == null || raw.isEmpty) continue;
       final parsed = parseWebrpcQr(raw);
       if (parsed.kind == WebrpcQrKind.peer) {
-        _tip('这是连接码，请在新建会话/网盘时扫');
+        _tip('这是连接码，请在新建会话/网盘时扫'.tr);
         return;
       }
       if (parsed.kind != WebrpcQrKind.login || parsed.login == null) {
-        _tip('无效的登录二维码');
+        _tip('无效的登录二维码'.tr);
         return;
       }
       _handled = true;
@@ -96,7 +97,7 @@ class _LoginQrScanScreenState extends State<LoginQrScanScreen> {
                   IconButton(
                     onPressed: () => Navigator.of(context).maybePop(),
                     icon: const Icon(Icons.close, color: Colors.white, size: 26),
-                    tooltip: '关闭',
+                    tooltip: '关闭'.tr,
                   ),
                   const Spacer(),
                   IconButton(
@@ -106,7 +107,7 @@ class _LoginQrScanScreenState extends State<LoginQrScanScreen> {
                       color: Colors.white,
                       size: 24,
                     ),
-                    tooltip: '手电筒',
+                    tooltip: '手电筒'.tr,
                   ),
                 ],
               ),
@@ -117,7 +118,7 @@ class _LoginQrScanScreenState extends State<LoginQrScanScreen> {
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 32),
               child: Text(
-                '将官网登录二维码放入框内\n即可自动扫描',
+                r'将官网登录二维码放入框内\n即可自动扫描'.tr,
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   color: Colors.white.withValues(alpha: 0.88),

@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -81,14 +82,14 @@ class _VoicePanel extends StatelessWidget {
   Widget build(BuildContext context) {
     final s = voice.state;
     final peer = s.peerToken.isEmpty
-        ? '对方'
+        ? '对方'.tr
         : (s.peerToken.length <= 12
             ? s.peerToken
             : '${s.peerToken.substring(0, 6)}…${s.peerToken.substring(s.peerToken.length - 4)}');
     final title = switch (s.phase) {
-      VoicePhase.outgoing => '正在呼叫…',
-      VoicePhase.incoming => '来电',
-      VoicePhase.active => '语音通话中',
+      VoicePhase.outgoing => '正在呼叫…'.tr,
+      VoicePhase.incoming => '来电'.tr,
+      VoicePhase.active => '语音通话中'.tr,
       VoicePhase.idle => '',
     };
     final elapsed = s.startedAt == null
@@ -123,13 +124,13 @@ class _VoicePanel extends StatelessWidget {
               _RoundAction(
                 color: const Color(0xFFE53935),
                 icon: Icons.call_end,
-                label: '拒绝',
+                label: '拒绝'.tr,
                 onTap: () => voice.rejectOrCancel(),
               ),
               _RoundAction(
                 color: const Color(0xFF43A047),
                 icon: Icons.call,
-                label: '接听',
+                label: '接听'.tr,
                 onTap: () async {
                   try {
                     await voice.accept();
@@ -152,13 +153,13 @@ class _VoicePanel extends StatelessWidget {
                 _RoundAction(
                   color: s.muted ? Colors.white24 : Colors.white12,
                   icon: s.muted ? Icons.mic_off : Icons.mic,
-                  label: s.muted ? '取消静音' : '静音',
+                  label: s.muted ? '取消静音'.tr : '静音'.tr,
                   onTap: () => voice.setMuted(!s.muted),
                 ),
               _RoundAction(
                 color: const Color(0xFFE53935),
                 icon: Icons.call_end,
-                label: s.phase == VoicePhase.outgoing ? '取消' : '挂断',
+                label: s.phase == VoicePhase.outgoing ? '取消'.tr : '挂断'.tr,
                 onTap: () => s.phase == VoicePhase.outgoing
                     ? voice.rejectOrCancel()
                     : voice.hangup(),

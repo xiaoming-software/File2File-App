@@ -1,3 +1,6 @@
+import 'dart:async';
+
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:provider/provider.dart';
@@ -7,6 +10,7 @@ import '../models/chat_models.dart';
 import '../services/auth_controller.dart';
 import '../services/chat_controller.dart';
 import '../theme/app_theme.dart';
+import '../utils/app_snack.dart';
 import '../utils/webrpc_qr.dart';
 import '../widgets/connection_form_sheet.dart';
 import 'chat_screen.dart';
@@ -29,7 +33,7 @@ class SessionsTab extends StatelessWidget {
         heroTag: 'sessions-tab-fab',
         onPressed: () => _showCreate(context),
         icon: const Icon(Icons.add),
-        label: const Text('新建会话'),
+        label: Text('新建会话'.tr),
       ),
       body: chat.loading
           ? const Center(child: CircularProgressIndicator())
@@ -79,6 +83,38 @@ class SessionsTab extends StatelessWidget {
     );
   }
 
+  /// Fire-and-forget: menu closes immediately; list shows「连接中…」via session.connecting.
+  void _connectChat(BuildContext context, ChatSession session) {
+    if (session.connecting || session.connected) return;
+    final auth = context.read<AuthController>();
+    final chat = context.read<ChatController>();
+    unawaited(() async {
+      try {
+        await chat.healAfterForeground(
+          session,
+          ensureWebrpc: ({bool forceRelogin = false}) =>
+              auth.ensureWebrpcAlive(forceRelogin: forceRelogin),
+        );
+        if (!session.connected && context.mounted) {
+          showAppSnack(
+            context,
+            session.connectError.isNotEmpty
+                ? session.connectError
+                : '连接失败，请重试'.tr,
+          );
+        }
+      } catch (e) {
+        if (context.mounted) {
+          showAppSnack(
+            context,
+            session.connectError.isNotEmpty ? session.connectError : e,
+            fallback: '连接失败，请重试'.tr,
+          );
+        }
+      }
+    }());
+  }
+
   Future<void> _showCreate(BuildContext context) async {
     final result = await showModalBottomSheet<_CreateResult>(
       context: context,
@@ -95,7 +131,7 @@ class SessionsTab extends StatelessWidget {
         remark: result.remark,
       );
       if (result.connectNow) {
-        await chat.connect(session);
+        _connectChat(context, session);
       }
       if (!context.mounted) return;
       chat.selectSession(session.id);
@@ -104,7 +140,7 @@ class SessionsTab extends StatelessWidget {
       );
     } catch (e) {
       if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+      showAppSnack(context, e, fallback: '连接失败，请重试'.tr);
     }
   }
 
@@ -116,22 +152,16 @@ class SessionsTab extends StatelessWidget {
     final chat = context.read<ChatController>();
     switch (action) {
       case 'connect':
-        try {
-          await chat.connect(session);
-        } catch (e) {
-          if (context.mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
-          }
-        }
+        _connectChat(context, session);
       case 'disconnect':
         await chat.disconnect(session);
       case 'remark':
         await _editMeta(context, session);
       case 'clear':
-        final ok = await _confirm(context, '清空聊天内容？会话本身会保留。');
+        final ok = await _confirm(context, '清空聊天内容？会话本身会保留。'.tr);
         if (ok) await chat.clearChat(session);
       case 'delete':
-        final ok = await _confirm(context, '删除该会话及本地聊天记录？');
+        final ok = await _confirm(context, '删除该会话及本地聊天记录？'.tr);
         if (ok) await chat.deleteSession(session);
     }
   }
@@ -158,8 +188,8 @@ class SessionsTab extends StatelessWidget {
       builder: (ctx) => AlertDialog(
         content: Text(text),
         actions: [
-          TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('取消')),
-          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('确定')),
+          TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text('取消'.tr)),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: Text('确定'.tr)),
         ],
       ),
     );
@@ -177,8 +207,8 @@ class _MyConnectionCard extends StatelessWidget {
   final String passphrase;
 
   String get _bundle {
-    final passLine = passphrase.isEmpty ? '（未设置）' : passphrase;
-    return 'Token：$token\n认证口令：$passLine';
+    final passLine = passphrase.isEmpty ? '（未设置）'.tr : passphrase;
+    return AppL10n.current.fill(r'Token：$token\n认证口令：$passLine', {r'$token': token, r'$passLine': passLine});
   }
 
   Future<void> _copy(BuildContext context, String value, String tip) async {
@@ -213,7 +243,7 @@ class _MyConnectionCard extends StatelessWidget {
               children: [
                 Expanded(
                   child: Text(
-                    '我的连接信息',
+                    '我的连接信息'.tr,
                     style: Theme.of(context).textTheme.titleSmall?.copyWith(
                           fontWeight: FontWeight.w700,
                           color: AppTheme.ink,
@@ -223,9 +253,9 @@ class _MyConnectionCard extends StatelessWidget {
                 TextButton.icon(
                   onPressed: token.isEmpty
                       ? null
-                      : () => _copy(context, _bundle, '已复制 Token 和口令'),
+                      : () => _copy(context, _bundle, '已复制 Token 和口令'.tr),
                   icon: const Icon(Icons.copy_all_outlined, size: 18),
-                  label: const Text('复制全部'),
+                  label: Text('复制全部'.tr),
                   style: TextButton.styleFrom(
                     foregroundColor: AppTheme.accent,
                     visualDensity: VisualDensity.compact,
@@ -236,7 +266,7 @@ class _MyConnectionCard extends StatelessWidget {
             ),
             const SizedBox(height: 2),
             Text(
-              '发给对方即可连你（不含 Token 密码）',
+              '发给对方即可连你（不含 Token 密码）'.tr,
               style: TextStyle(
                 fontSize: 12,
                 color: AppTheme.ink.withValues(alpha: 0.45),
@@ -256,20 +286,20 @@ class _MyConnectionCard extends StatelessWidget {
                         onCopy: () => _copy(
                           context,
                           token,
-                          token.isEmpty ? 'Token 为空' : '已复制 Token',
+                          token.isEmpty ? 'Token 为空'.tr : '已复制 Token'.tr,
                         ),
                       ),
                       const SizedBox(height: 6),
                       _CopyRow(
-                        label: '口令',
+                        label: '口令'.tr,
                         value: passphrase.isEmpty
-                            ? '未设置'
+                            ? '未设置'.tr
                             : _ellipsize(passphrase, head: 8, tail: 2),
                         dimmed: passphrase.isEmpty,
                         onCopy: () => _copy(
                           context,
                           passphrase,
-                          passphrase.isEmpty ? '已复制空口令' : '已复制认证口令',
+                          passphrase.isEmpty ? '已复制空口令'.tr : '已复制认证口令'.tr,
                         ),
                       ),
                     ],
@@ -304,7 +334,7 @@ class _MyPeerQrThumb extends StatelessWidget {
     if (!_ready) {
       ScaffoldMessenger.of(context).hideCurrentSnackBar();
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请先设置认证口令后再生成二维码')),
+        SnackBar(content: Text('请先设置认证口令后再生成二维码'.tr)),
       );
       return;
     }
@@ -376,7 +406,7 @@ class _MyPeerQrThumb extends StatelessWidget {
               ),
               const SizedBox(height: 4),
               Text(
-                _ready ? '点开扫码' : '先设口令',
+                _ready ? '点开扫码'.tr : '先设口令'.tr,
                 style: TextStyle(
                   fontSize: 10.5,
                   fontWeight: FontWeight.w600,
@@ -445,7 +475,7 @@ class _CopyRow extends StatelessWidget {
                 ),
               ),
               IconButton(
-                tooltip: '复制',
+                tooltip: '复制'.tr,
                 onPressed: onCopy,
                 visualDensity: VisualDensity.compact,
                 icon: Icon(
@@ -477,7 +507,7 @@ class _Empty extends StatelessWidget {
             Icon(Icons.forum_outlined, size: 56, color: AppTheme.accent.withValues(alpha: 0.8)),
             const SizedBox(height: 16),
             Text(
-              '还没有会话',
+              '还没有会话'.tr,
               style: Theme.of(context).textTheme.titleLarge?.copyWith(
                     fontWeight: FontWeight.w700,
                     color: AppTheme.ink,
@@ -485,7 +515,7 @@ class _Empty extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             Text(
-              '添加对方 Token 与认证口令后即可文字聊天、传文件',
+              '添加对方 Token 与认证口令后即可文字聊天、传文件'.tr,
               textAlign: TextAlign.center,
               style: TextStyle(color: AppTheme.ink.withValues(alpha: 0.65)),
             ),
@@ -493,7 +523,7 @@ class _Empty extends StatelessWidget {
             FilledButton.icon(
               onPressed: onCreate,
               icon: const Icon(Icons.add),
-              label: const Text('新建会话'),
+              label: Text('新建会话'.tr),
             ),
           ],
         ),
@@ -516,7 +546,7 @@ class _SessionTile extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final last = session.lastMessage;
-    String preview = '暂无消息';
+    String preview = '暂无消息'.tr;
     if (last != null) {
       if (last.kind == ChatMsgKind.text) {
         preview = last.content;
@@ -535,7 +565,16 @@ class _SessionTile extends StatelessWidget {
           padding: const EdgeInsets.fromLTRB(14, 12, 6, 12),
           child: Row(
             children: [
-              _Avatar(connected: session.connected, connecting: session.connecting),
+              Badge(
+                isLabelVisible: session.unreadCount > 0,
+                label: Text(
+                  session.unreadCount > 99 ? '99+' : '${session.unreadCount}',
+                ),
+                child: _Avatar(
+                  connected: session.connected,
+                  connecting: session.connecting,
+                ),
+              ),
               const SizedBox(width: 12),
               Expanded(
                 child: Column(
@@ -580,12 +619,12 @@ class _SessionTile extends StatelessWidget {
                 onSelected: onMenu,
                 itemBuilder: (ctx) => [
                   if (!session.connected)
-                    const PopupMenuItem(value: 'connect', child: Text('连接')),
+                    PopupMenuItem(value: 'connect', child: Text('连接'.tr)),
                   if (session.connected)
-                    const PopupMenuItem(value: 'disconnect', child: Text('断开连接')),
-                  const PopupMenuItem(value: 'remark', child: Text('备注 / 口令')),
-                  const PopupMenuItem(value: 'clear', child: Text('清空内容')),
-                  const PopupMenuItem(value: 'delete', child: Text('删除会话')),
+                    PopupMenuItem(value: 'disconnect', child: Text('断开连接'.tr)),
+                  PopupMenuItem(value: 'remark', child: Text('备注 / 口令'.tr)),
+                  PopupMenuItem(value: 'clear', child: Text('清空内容'.tr)),
+                  PopupMenuItem(value: 'delete', child: Text('删除会话'.tr)),
                 ],
               ),
             ],
@@ -663,20 +702,20 @@ class _EditSessionMetaDialogState extends State<_EditSessionMetaDialog> {
   @override
   Widget build(BuildContext context) {
     return AlertDialog(
-      title: const Text('会话设置'),
+      title: Text('会话设置'.tr),
       content: SingleChildScrollView(
         child: Column(
           mainAxisSize: MainAxisSize.min,
           children: [
             TextField(
               controller: _remark,
-              decoration: const InputDecoration(labelText: '备注名'),
+              decoration: InputDecoration(labelText: '备注名'.tr),
               textInputAction: TextInputAction.next,
             ),
             const SizedBox(height: 12),
             TextField(
               controller: _pass,
-              decoration: const InputDecoration(labelText: '对方认证口令'),
+              decoration: InputDecoration(labelText: '对方认证口令'.tr),
               textInputAction: TextInputAction.done,
               onSubmitted: (_) => _save(),
             ),
@@ -686,11 +725,11 @@ class _EditSessionMetaDialogState extends State<_EditSessionMetaDialog> {
       actions: [
         TextButton(
           onPressed: () => Navigator.pop(context),
-          child: const Text('取消'),
+          child: Text('取消'.tr),
         ),
         FilledButton(
           onPressed: _save,
-          child: const Text('保存'),
+          child: Text('保存'.tr),
         ),
       ],
     );
@@ -751,7 +790,7 @@ class _CreateSessionSheetState extends State<_CreateSessionSheet> {
       _pass.text = result.permission;
     });
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('已填入对方 Token 与口令')),
+      SnackBar(content: Text('已填入对方 Token 与口令'.tr)),
     );
   }
 
@@ -759,7 +798,7 @@ class _CreateSessionSheetState extends State<_CreateSessionSheet> {
     final token = _token.text.trim();
     if (token.isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请填写对方 Token')),
+        SnackBar(content: Text('请填写对方 Token'.tr)),
       );
       return;
     }
@@ -778,15 +817,15 @@ class _CreateSessionSheetState extends State<_CreateSessionSheet> {
   Widget build(BuildContext context) {
     return ConnectionFormSheet(
       icon: Icons.chat_bubble_rounded,
-      title: '新建会话',
-      subtitle: '扫一扫对方二维码，或手动填写 Token 与口令',
-      primaryLabel: _connectNow ? '创建并连接' : '创建',
+      title: '新建会话'.tr,
+      subtitle: '扫一扫对方二维码，或手动填写 Token 与口令'.tr,
+      primaryLabel: _connectNow ? '创建并连接'.tr : '创建'.tr,
       onPrimary: _submit,
       children: [
         OutlinedButton.icon(
           onPressed: _scanPeerQr,
           icon: const Icon(Icons.qr_code_scanner_rounded, size: 20),
-          label: const Text('扫一扫填入'),
+          label: Text('扫一扫填入'.tr),
           style: OutlinedButton.styleFrom(
             foregroundColor: AppTheme.accent,
             side: BorderSide(color: AppTheme.accent.withValues(alpha: 0.35)),
@@ -798,25 +837,25 @@ class _CreateSessionSheetState extends State<_CreateSessionSheet> {
         ),
         const SizedBox(height: 12),
         FormFieldBlock(
-          label: '对方 Token',
+          label: '对方 Token'.tr,
           controller: _token,
-          hint: '粘贴对方的 Token',
+          hint: '粘贴对方的 Token'.tr,
           autofocus: true,
           textCapitalization: TextCapitalization.characters,
           textInputAction: TextInputAction.next,
           onChanged: (_) => setState(() {}),
         ),
         FormFieldBlock(
-          label: '对方认证口令',
+          label: '对方认证口令'.tr,
           controller: _pass,
-          hint: '对方未设置则可留空',
+          hint: '对方未设置则可留空'.tr,
           optional: true,
           textInputAction: TextInputAction.next,
         ),
         FormFieldBlock(
-          label: '备注名',
+          label: '备注名'.tr,
           controller: _remark,
-          hint: '例如：家里电脑',
+          hint: '例如：家里电脑'.tr,
           optional: true,
           textInputAction: TextInputAction.done,
           onChanged: (_) {},
@@ -824,7 +863,7 @@ class _CreateSessionSheetState extends State<_CreateSessionSheet> {
         ConnectNowToggle(
           value: _connectNow,
           onChanged: (v) => setState(() => _connectNow = v),
-          subtitle: '创建后立刻发起会话连接',
+          subtitle: '创建后立刻发起会话连接'.tr,
         ),
       ],
     );

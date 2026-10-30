@@ -1,5 +1,6 @@
 import 'dart:io';
 
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:gal/gal.dart';
 import 'package:path/path.dart' as p;
 import 'package:path_provider/path_provider.dart';
@@ -10,25 +11,25 @@ import '../models/chat_models.dart';
 class MediaSaveService {
   Future<String> savePathToAlbum(String path, {required bool video}) async {
     if (path.isEmpty || !await File(path).exists()) {
-      throw StateError('本地文件不存在');
+      throw StateError('本地文件不存在'.tr);
     }
     final hasAccess = await Gal.hasAccess(toAlbum: true);
     if (!hasAccess) {
       final ok = await Gal.requestAccess(toAlbum: true);
-      if (!ok) throw StateError('没有相册写入权限');
+      if (!ok) throw StateError('没有相册写入权限'.tr);
     }
     if (video) {
       await Gal.putVideo(path, album: 'File2File');
     } else {
       await Gal.putImage(path, album: 'File2File');
     }
-    return '已保存到相册';
+    return '已保存到相册'.tr;
   }
 
   Future<String> saveToAlbum(ChatMessage msg) async {
     final srcPath = await _requireLocal(msg);
     if (msg.kind != ChatMsgKind.image && msg.kind != ChatMsgKind.video) {
-      throw StateError('仅图片/视频可保存到相册');
+      throw StateError('仅图片/视频可保存到相册'.tr);
     }
     return savePathToAlbum(srcPath, video: msg.kind == ChatMsgKind.video);
   }
@@ -44,7 +45,7 @@ class MediaSaveService {
       if (!status.isGranted) {
         final storage = await Permission.storage.request();
         if (!storage.isGranted) {
-          throw StateError('没有存储权限');
+          throw StateError('没有存储权限'.tr);
         }
       }
     }
@@ -58,7 +59,7 @@ class MediaSaveService {
     } else {
       downloads = await getApplicationDocumentsDirectory();
     }
-    if (downloads == null) throw StateError('无法定位下载目录');
+    if (downloads == null) throw StateError('无法定位下载目录'.tr);
     if (!await downloads.exists()) await downloads.create(recursive: true);
 
     var dest = File(p.join(downloads.path, name));
@@ -73,7 +74,7 @@ class MediaSaveService {
       );
     }
     await File(srcPath).copy(dest.path);
-    return '已保存到 ${dest.path}';
+    return AppL10n.current.fill(r'已保存到 ${dest.path}', {r'${dest.path}': dest.path});
   }
 
   /// Legacy helper: media → album, others → downloads.
@@ -87,7 +88,7 @@ class MediaSaveService {
   Future<String> _requireLocal(ChatMessage msg) async {
     final srcPath = msg.filePath;
     if (srcPath.isEmpty || !await File(srcPath).exists()) {
-      throw StateError('本地文件不存在');
+      throw StateError('本地文件不存在'.tr);
     }
     return srcPath;
   }

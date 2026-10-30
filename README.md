@@ -54,7 +54,7 @@ P2P 直连 · 默认加密 · 无需公网 IP · 基于 [webrpc](https://www.web
 - 传输进度、失败重试；接收文件可下载或保存到相册
 - 与 [File2File Desktop](https://github.com/xiaoming-software/File2File-Desktop/tree/main) 使用同一套 webrpc 会话与消息协议，可互通
 
-<img src="img/file2windows.png" alt="用 App 把图片传到电脑" width="280">
+![用 App 把图片传到电脑](img/file2windows.png)
 
 *手机连上电脑后发送图片：进度、速率与「发送成功」会显示在会话里。*
 
@@ -62,7 +62,7 @@ P2P 直连 · 默认加密 · 无需公网 IP · 基于 [webrpc](https://www.web
 
 连接自建的 [`mywebdisk-server`](https://github.com/xiaoming-software/mywebdisk) 后，可在手机上：
 
-<img src="img/mywebdisk.png" alt="网盘会话列表" width="280">
+![网盘会话列表](img/mywebdisk.png)
 
 *「网盘」页：已连接的个人网盘会话，以及「新建网盘」。*
 
@@ -75,7 +75,7 @@ P2P 直连 · 默认加密 · 无需公网 IP · 基于 [webrpc](https://www.web
 | 整理 | 新建文件夹、重命名、移动、删除、多选批量操作 |
 | 搜索 | 全盘按文件名搜索 |
 
-<img src="img/mywebdisk-data.png" alt="在 App 里浏览个人网盘目录" width="280">
+![在 App 里浏览个人网盘目录](img/mywebdisk-data.png)
 
 *进入网盘后浏览目录：容量、搜索、文件夹与各类文件一目了然。*
 
@@ -155,7 +155,7 @@ flutter doctor
 ```bash
 source tool/env.sh
 flutter emulators --launch File2File_API35_arm64
-flutter run -d emulator-5554
+flutter run --release  -d emulator-5554
 ```
 
 > webrpc Android 库目前仅提供 **arm64-v8a**。请使用 arm64 模拟器或 arm64 真机，不要使用 x86 系统镜像。

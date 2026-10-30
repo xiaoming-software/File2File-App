@@ -1,3 +1,4 @@
+import 'package:file2file/l10n/app_l10n.dart';
 import 'dart:convert';
 
 import '../models/chat_models.dart' show ChatMsgKind, classifyFileName, safeFileName;
@@ -142,6 +143,8 @@ class DriveTransfer {
     this.startedAt,
     this.speedBps = 0,
     this.cancelableByPreview = false,
+    this.saveMediaToAlbum = false,
+    this.resultNote = '',
   });
 
   final String id;
@@ -158,6 +161,12 @@ class DriveTransfer {
 
   /// Preview-created download; may be cancelled when preview closes.
   bool cancelableByPreview;
+
+  /// Explicit download of image/video → export into the system Photos album.
+  bool saveMediaToAlbum;
+
+  /// Success footnote (e.g. saved to album); shown when status is done.
+  String resultNote;
 
   /// Soft-cancel while running (chunk loop / waiter check this).
   bool cancelRequested = false;
@@ -188,6 +197,10 @@ class DriveSession {
   bool connected = false;
   bool connecting = false;
   String connectError = '';
+
+  /// Server advertised `caps:["driveResume"]` via backNasInfo.
+  bool peerCapsResume = false;
+  int peerDriveProto = 0;
 
   String currentPath = '/';
   List<NasEntry> entries = [];
@@ -226,7 +239,7 @@ class DriveSession {
     final r = remark.trim();
     if (r.isNotEmpty) return r;
     final t = peerToken.trim();
-    if (t.length <= 12) return t.isEmpty ? '网盘' : t;
+    if (t.length <= 12) return t.isEmpty ? '网盘'.tr : t;
     return '${t.substring(0, 6)}…${t.substring(t.length - 4)}';
   }
 

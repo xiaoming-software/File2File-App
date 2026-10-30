@@ -1,3 +1,5 @@
+import 'package:file2file/l10n/app_l10n.dart';
+import 'package:file2file/l10n/locale_controller.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -10,7 +12,13 @@ import '../theme/app_theme.dart';
 import 'login_qr_scan_screen.dart';
 
 class LoginScreen extends StatefulWidget {
-  const LoginScreen({super.key});
+  const LoginScreen({
+    super.key,
+    this.formGeneration = 0,
+  });
+
+  /// When this increases, fields were cleared by logout/forget/delete.
+  final int formGeneration;
 
   @override
   State<LoginScreen> createState() => _LoginScreenState();
@@ -30,15 +38,25 @@ class _LoginScreenState extends State<LoginScreen> {
   void initState() {
     super.initState();
     _webrpcTap = TapGestureRecognizer()..onTap = _openWebrpc;
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      final auth = context.read<AuthController>();
-      final last = auth.savedAccounts.isEmpty ? null : auth.savedAccounts.first;
-      if (last != null) {
-        _tokenCtrl.text = last.token;
-        _passwordCtrl.text = last.password;
-        _passphraseCtrl.text = last.passphrase;
-      }
-    });
+    WidgetsBinding.instance.addPostFrameCallback((_) => _hydrateFields());
+  }
+
+  void _hydrateFields() {
+    if (!mounted) return;
+    final auth = context.read<AuthController>();
+    // After 退出并忘记 / 删本机 / 注销：keep empty (do not autofill).
+    if (widget.formGeneration > 0) {
+      _tokenCtrl.clear();
+      _passwordCtrl.clear();
+      _passphraseCtrl.clear();
+      return;
+    }
+    final last = auth.savedAccounts.isEmpty ? null : auth.savedAccounts.first;
+    if (last != null) {
+      _tokenCtrl.text = last.token;
+      _passwordCtrl.text = last.password;
+      _passphraseCtrl.text = last.passphrase;
+    }
   }
 
   @override
@@ -54,7 +72,7 @@ class _LoginScreenState extends State<LoginScreen> {
     final ok = await launchUrl(_webrpcUri, mode: LaunchMode.externalApplication);
     if (!ok && mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('无法打开浏览器')),
+        SnackBar(content: Text('无法打开浏览器'.tr)),
       );
     }
   }
@@ -74,7 +92,7 @@ class _LoginScreenState extends State<LoginScreen> {
       _passwordCtrl.text = result.password;
     });
     ScaffoldMessenger.of(context).showSnackBar(
-      const SnackBar(content: Text('已填入 Token 与密码，请确认口令后登录')),
+      SnackBar(content: Text('已填入 Token 与密码，请确认口令后登录'.tr)),
     );
   }
 
@@ -82,7 +100,7 @@ class _LoginScreenState extends State<LoginScreen> {
     final auth = context.read<AuthController>();
     if (_passphraseCtrl.text.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('请设置认证口令（不能为空）')),
+        SnackBar(content: Text('请设置认证口令（不能为空）'.tr)),
       );
       return;
     }
@@ -96,30 +114,76 @@ class _LoginScreenState extends State<LoginScreen> {
     } catch (_) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(auth.errorMessage ?? '登录失败')),
+        SnackBar(content: Text(auth.errorMessage ?? '登录失败'.tr)),
       );
     }
   }
 
   Future<void> _oneClick() async {
+    FocusScope.of(context).unfocus();
     final auth = context.read<AuthController>();
     try {
       final created = await auth.oneClickRegister();
       if (!mounted) return;
-      if (created != null) {
+      if (created == null) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text(auth.errorMessage ?? '一键注册失败'.tr)),
+        );
+        return;
+      }
+      setState(() {
         _tokenCtrl.text = created.token;
         _passwordCtrl.text = created.password;
         _passphraseCtrl.clear();
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Token 已领取，请设置认证口令后登录')),
-        );
-      }
-    } catch (_) {
-      if (!mounted) return;
+      });
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(auth.errorMessage ?? '一键注册失败')),
+        SnackBar(content: Text('Token 已领取，请设置认证口令后登录'.tr)),
+      );
+    } catch (e) {
+      if (!mounted) return;
+      final msg = auth.errorMessage ?? e.toString();
+      debugPrint('[login] oneClick failed: $msg');
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text(msg.isEmpty ? '一键注册失败'.tr : msg)),
       );
     }
+  }
+
+  Future<void> _forgetSaved(SavedAccount a) async {
+    final ok = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => AlertDialog(
+        title: Text('删除本机账号'.tr),
+        content: Text(
+          '仅从本机清除该 Token 的缓存凭证，不会作废 webrpc 上的 Token。'.tr
+          + '若要彻底注销，请先登录后使用「删除账号与本机数据」。'.tr,
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(ctx, false),
+            child: Text('取消'.tr),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.pop(ctx, true),
+            child: Text('删除'.tr),
+          ),
+        ],
+      ),
+    );
+    if (ok != true || !mounted) return;
+    final auth = context.read<AuthController>();
+    await auth.forgetSavedAccount(a.token);
+    if (_tokenCtrl.text.trim() == a.token.trim()) {
+      setState(() {
+        _tokenCtrl.clear();
+        _passwordCtrl.clear();
+        _passphraseCtrl.clear();
+      });
+    }
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('已从本机删除该账号'.tr)),
+    );
   }
 
   Future<void> _loginSaved(SavedAccount a) async {
@@ -129,7 +193,7 @@ class _LoginScreenState extends State<LoginScreen> {
     _passphraseCtrl.text = a.passphrase;
     if (a.passphrase.trim().isEmpty) {
       ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('该账号未设置认证口令，请填写后再登录')),
+        SnackBar(content: Text('该账号未设置认证口令，请填写后再登录'.tr)),
       );
       return;
     }
@@ -138,15 +202,17 @@ class _LoginScreenState extends State<LoginScreen> {
     } catch (_) {
       if (!mounted) return;
       ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text(auth.errorMessage ?? '登录失败')),
+        SnackBar(content: Text(auth.errorMessage ?? '登录失败'.tr)),
       );
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    // Ensure login copy rebuilds when language changes.
+    context.watch<LocaleController>();
     final auth = context.watch<AuthController>();
-    final showSaved = auth.savedAccounts.length > 1;
+    final showSaved = auth.savedAccounts.isNotEmpty;
 
     return AnnotatedRegion<SystemUiOverlayStyle>(
       value: SystemUiOverlayStyle.dark,
@@ -206,6 +272,7 @@ class _LoginScreenState extends State<LoginScreen> {
                                   accounts: auth.savedAccounts,
                                   enabled: !auth.busy,
                                   onTap: _loginSaved,
+                                  onDelete: _forgetSaved,
                                 ),
                               ),
                             ],
@@ -222,18 +289,66 @@ class _LoginScreenState extends State<LoginScreen> {
                   alignment: Alignment.topRight,
                   child: Padding(
                     padding: const EdgeInsets.only(right: 6, top: 2),
-                    child: IconButton(
-                      tooltip: '扫一扫',
-                      onPressed: auth.busy ? null : _scanLoginQr,
-                      icon: Icon(
-                        Icons.qr_code_scanner_rounded,
-                        size: 26,
-                        color: AppTheme.ink.withValues(alpha: auth.busy ? 0.28 : 0.75),
-                      ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        const _LangToggle(),
+                        IconButton(
+                          tooltip: '扫一扫'.tr,
+                          onPressed: auth.busy ? null : _scanLoginQr,
+                          icon: Icon(
+                            Icons.qr_code_scanner_rounded,
+                            size: 26,
+                            color: AppTheme.ink.withValues(
+                              alpha: auth.busy ? 0.28 : 0.75,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
                   ),
                 ),
               ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _LangToggle extends StatelessWidget {
+  const _LangToggle();
+
+  @override
+  Widget build(BuildContext context) {
+    final zh = context.watch<LocaleController>().locale.languageCode == 'zh';
+    final active = TextStyle(
+      fontSize: 13,
+      fontWeight: FontWeight.w800,
+      color: AppTheme.ink,
+    );
+    final idle = active.copyWith(
+      fontWeight: FontWeight.w500,
+      color: AppTheme.ink.withValues(alpha: 0.35),
+    );
+    return Material(
+      color: Colors.white.withValues(alpha: 0.72),
+      borderRadius: BorderRadius.circular(20),
+      child: InkWell(
+        borderRadius: BorderRadius.circular(20),
+        onTap: () {
+          // Fire-and-forget: LocaleController notifies before prefs I/O.
+          context.read<LocaleController>().toggleZhEn();
+        },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Text('中', style: zh ? active : idle),
+              Text(' | ', style: idle),
+              Text('EN', style: zh ? idle : active),
             ],
           ),
         ),
@@ -304,7 +419,7 @@ class _BrandBlock extends StatelessWidget {
                 color: AppTheme.ink.withValues(alpha: 0.55),
               ),
               children: [
-                const TextSpan(text: '基于'),
+                TextSpan(text: '基于'.tr),
                 TextSpan(
                   text: 'webrpc',
                   style: const TextStyle(
@@ -315,7 +430,7 @@ class _BrandBlock extends StatelessWidget {
                   ),
                   recognizer: webrpcTap,
                 ),
-                const TextSpan(text: ' p2p 的文件传输和网盘管理'),
+                TextSpan(text: ' p2p 的文件传输和网盘管理'.tr),
               ],
             ),
             textAlign: TextAlign.center,
@@ -383,13 +498,13 @@ class _LoginCard extends StatelessWidget {
             _LabeledField(
               label: 'Token',
               controller: tokenCtrl,
-              hint: '粘贴设备 Token',
+              hint: '粘贴设备 Token'.tr,
               textCapitalization: TextCapitalization.characters,
               textInputAction: TextInputAction.next,
             ),
             const SizedBox(height: 12),
             _LabeledField(
-              label: 'Token 密码',
+              label: 'Token 密码'.tr,
               controller: passwordCtrl,
               obscure: obscurePassword,
               textInputAction: TextInputAction.next,
@@ -407,9 +522,9 @@ class _LoginCard extends StatelessWidget {
             ),
             const SizedBox(height: 12),
             _LabeledField(
-              label: '认证口令',
+              label: '认证口令'.tr,
               controller: passphraseCtrl,
-              hint: '对方连接你时需填写',
+              hint: '对方连接你时需填写'.tr,
               textInputAction: TextInputAction.done,
               onSubmitted: (_) => onLogin(),
             ),
@@ -435,7 +550,7 @@ class _LoginCard extends StatelessWidget {
                   child: GestureDetector(
                     onTap: busy ? null : () => onRemember(!remember),
                     child: Text(
-                      '记住账号，下次自动登录',
+                      '记住账号，下次自动登录'.tr,
                       style: TextStyle(
                         fontSize: 13,
                         color: AppTheme.ink.withValues(alpha: 0.7),
@@ -487,8 +602,8 @@ class _LoginCard extends StatelessWidget {
                         color: Colors.white,
                       ),
                     )
-                  : const Text(
-                      '登录',
+                  : Text(
+                      '登录'.tr,
                       style: TextStyle(
                         fontSize: 15.5,
                         fontWeight: FontWeight.w600,
@@ -504,8 +619,8 @@ class _LoginCard extends StatelessWidget {
               ),
               child: Text(
                 registerRemaining <= 0
-                    ? '一键注册次数已用完'
-                    : '没有 Token？一键注册（剩 $registerRemaining 次）',
+                    ? '一键注册次数已用完'.tr
+                    : AppL10n.current.fill(r'没有 Token？一键注册（剩 $registerRemaining 次）', {r'$registerRemaining': '$registerRemaining'}),
                 style: const TextStyle(
                   fontSize: 13.5,
                   fontWeight: FontWeight.w600,
@@ -608,11 +723,13 @@ class _SavedAccounts extends StatelessWidget {
     required this.accounts,
     required this.enabled,
     required this.onTap,
+    required this.onDelete,
   });
 
   final List<SavedAccount> accounts;
   final bool enabled;
   final ValueChanged<SavedAccount> onTap;
+  final ValueChanged<SavedAccount> onDelete;
 
   @override
   Widget build(BuildContext context) {
@@ -620,7 +737,7 @@ class _SavedAccounts extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.stretch,
       children: [
         Text(
-          '已保存账号',
+          '已保存账号'.tr,
           style: TextStyle(
             fontSize: 12.5,
             fontWeight: FontWeight.w700,
@@ -641,9 +758,10 @@ class _SavedAccounts extends StatelessWidget {
                 onTap: enabled ? () => onTap(a) : null,
                 borderRadius: BorderRadius.circular(12),
                 child: Padding(
-                  padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 6),
                   child: Row(
                     children: [
+                      const SizedBox(width: 4),
                       Icon(
                         Icons.account_circle_outlined,
                         size: 22,
@@ -663,7 +781,7 @@ class _SavedAccounts extends StatelessWidget {
                               ),
                             ),
                             Text(
-                              a.autoRegistered ? '一键注册账号' : '手动 Token',
+                              a.autoRegistered ? '一键注册账号'.tr : '手动 Token'.tr,
                               style: TextStyle(
                                 fontSize: 11.5,
                                 color: AppTheme.ink.withValues(alpha: 0.42),
@@ -672,9 +790,13 @@ class _SavedAccounts extends StatelessWidget {
                           ],
                         ),
                       ),
-                      Icon(
-                        Icons.chevron_right_rounded,
-                        color: AppTheme.ink.withValues(alpha: 0.28),
+                      IconButton(
+                        tooltip: '删除本机缓存'.tr,
+                        onPressed: enabled ? () => onDelete(a) : null,
+                        icon: Icon(
+                          Icons.delete_outline,
+                          color: AppTheme.ink.withValues(alpha: 0.45),
+                        ),
                       ),
                     ],
                   ),

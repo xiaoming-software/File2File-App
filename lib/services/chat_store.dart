@@ -100,6 +100,27 @@ class ChatStore {
     await clearMessages(owner, peer);
   }
 
+  /// 删除该 owner 下本机会话、聊天记录与接收文件目录。
+  Future<void> wipeOwner(String owner) async {
+    final o = owner.trim();
+    if (o.isEmpty) return;
+    final root = await _root();
+    final sessions = await _sessionsFile(o);
+    if (await sessions.exists()) {
+      try {
+        await sessions.delete();
+      } catch (_) {}
+    }
+    for (final sub in ['chats', 'files']) {
+      final dir = Directory(p.join(root.path, sub, _safe(o)));
+      if (await dir.exists()) {
+        try {
+          await dir.delete(recursive: true);
+        } catch (_) {}
+      }
+    }
+  }
+
   String _safe(String s) =>
       s.trim().replaceAll(RegExp(r'[^A-Za-z0-9._-]'), '_');
 }

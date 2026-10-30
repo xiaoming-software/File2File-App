@@ -1,3 +1,5 @@
+import 'package:file2file/l10n/app_l10n.dart';
+
 /// File/folder kind for NAS icons — mirrors Desktop `classifyNasName`.
 enum NasFileKind {
   folder,
@@ -142,15 +144,15 @@ NasFileKind classifyNasName(String name, {bool isDir = false}) {
 
 extension NasFileKindMeta on NasFileKind {
   String get label => switch (this) {
-        NasFileKind.folder => '文件夹',
-        NasFileKind.image => '图像',
-        NasFileKind.video => '影片',
-        NasFileKind.audio => '音频',
-        NasFileKind.pdf => 'PDF 文稿',
-        NasFileKind.archive => '压缩包',
-        NasFileKind.doc => '文稿',
-        NasFileKind.text => '文本',
-        NasFileKind.code => '代码',
-        NasFileKind.file => '文稿',
+        NasFileKind.folder => '文件夹'.tr,
+        NasFileKind.image => '图像'.tr,
+        NasFileKind.video => '影片'.tr,
+        NasFileKind.audio => '音频'.tr,
+        NasFileKind.pdf => 'PDF 文稿'.tr,
+        NasFileKind.archive => '压缩包'.tr,
+        NasFileKind.doc => '文稿'.tr,
+        NasFileKind.text => '文本'.tr,
+        NasFileKind.code => '代码'.tr,
+        NasFileKind.file => '文稿'.tr,
       };
 }

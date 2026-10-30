@@ -1,3 +1,4 @@
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
@@ -46,11 +47,11 @@ class _PeerQrScanScreenState extends State<PeerQrScanScreen> {
       if (raw == null || raw.isEmpty) continue;
       final parsed = parseWebrpcQr(raw);
       if (parsed.kind == WebrpcQrKind.login) {
-        _tip('这是登录码，请用登录页扫');
+        _tip('这是登录码，请用登录页扫'.tr);
         return;
       }
       if (parsed.kind != WebrpcQrKind.peer || parsed.peer == null) {
-        _tip('无效的连接二维码');
+        _tip('无效的连接二维码'.tr);
         return;
       }
       _handled = true;
@@ -94,7 +95,7 @@ class _PeerQrScanScreenState extends State<PeerQrScanScreen> {
                   IconButton(
                     onPressed: () => Navigator.of(context).maybePop(),
                     icon: const Icon(Icons.close, color: Colors.white, size: 26),
-                    tooltip: '关闭',
+                    tooltip: '关闭'.tr,
                   ),
                   const Spacer(),
                   IconButton(
@@ -104,7 +105,7 @@ class _PeerQrScanScreenState extends State<PeerQrScanScreen> {
                       color: Colors.white,
                       size: 24,
                     ),
-                    tooltip: '手电筒',
+                    tooltip: '手电筒'.tr,
                   ),
                 ],
               ),
@@ -115,7 +116,7 @@ class _PeerQrScanScreenState extends State<PeerQrScanScreen> {
             child: Padding(
               padding: const EdgeInsets.symmetric(horizontal: 32),
               child: Text(
-                '将对方连接二维码放入框内\n即可自动填入 Token 与口令',
+                r'将对方连接二维码放入框内\n即可自动填入 Token 与口令'.tr,
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   color: Colors.white.withValues(alpha: 0.88),

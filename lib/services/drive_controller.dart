@@ -1,13 +1,20 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/foundation.dart';
 import 'package:path/path.dart' as p;
 import 'package:uuid/uuid.dart';
 
 import '../models/drive_models.dart';
+import '../utils/user_facing_error.dart';
+import 'app_debug_log.dart';
+import 'drive_media_proxy.dart';
+import 'drive_protocol.dart';
 import 'drive_store.dart';
+import 'media_save_service.dart';
 import 'webrpc_service.dart';
 
 class _PutAck {
@@ -45,6 +52,23 @@ class _RecvFile {
   int settleEpoch = 0;
 }
 
+class _ThumbJob {
+  _ThumbJob({
+    required this.sessionId,
+    required this.peerToken,
+    required this.dir,
+    required this.name,
+    required this.key,
+  });
+  final String sessionId;
+  final String peerToken;
+  final String dir;
+  final String name;
+  final String key;
+}
+
+Uint8List _decodeThumbB64(String dataB64) => base64Decode(dataB64);
+
 /// Personal drive (mywebdisk-server) over webrpc string-typed NAS messages.
 class DriveController extends ChangeNotifier {
   DriveController({
@@ -55,7 +79,10 @@ class DriveController extends ChangeNotifier {
 
   final WebrpcService _webrpc;
   final DriveStore _store;
+  final MediaSaveService _mediaSave = MediaSaveService();
   final _uuid = const Uuid();
+  /// session.id → local HTTP media proxy (video/audio Range streaming).
+  final Map<String, DriveMediaProxy> _mediaProxies = {};
 
   String _ownerToken = '';
   final List<DriveSession> sessions = [];
@@ -64,17 +91,63 @@ class DriveController extends ChangeNotifier {
   final Map<int, String> _pendingListPath = {};
   final Map<int, Completer<_PutAck>> _putWait = {};
   final Map<int, _ListWait> _verifyList = {};
+  final Map<int, Completer<bool>> _listWait = {};
   final Map<String, _RecvFile> _recv = {};
   final Map<String, Completer<bool>> _opWait = {};
   final Map<String, Future<void>> _chunkWriteChain = {};
   final Set<String> _uploadBusy = {};
   final Set<String> _downloadBusy = {};
+  final Set<String> _healingSessionIds = {};
+  Timer? _heartbeatTimer;
+  bool _appForeground = true;
+  final Map<String, int> _heartbeatMisses = {};
 
   /// sessionId::dir::name -> local jpeg path
   final Map<String, String> _thumbPaths = {};
   final Set<String> _thumbPending = {};
   final Set<String> _thumbFailed = {};
   static const thumbEdge = 192;
+  /// Keep webrpc free for list/nav; 8 saturated the session and made UI crawl.
+  static const int thumbMaxInFlight = 2;
+
+  /// Thumb UI updates only — does NOT rebuild the whole drive browser.
+  /// Listeners should only [setState] when their own path changes.
+  final ValueNotifier<int> thumbTick = ValueNotifier<int>(0);
+  final List<_ThumbJob> _thumbHigh = [];
+  final List<_ThumbJob> _thumbLow = [];
+  final Map<String, Completer<void>> _thumbRpcWait = {};
+  int _thumbInFlight = 0;
+  Timer? _thumbNotifyTimer;
+  bool _thumbNotifyDirty = false;
+  /// Nested pause for getPath / connect (critical RPC).
+  int _thumbNavPause = 0;
+  /// True while the user is scrolling the file list.
+  bool _thumbScrollPaused = false;
+  /// fire-and-forget listPath: release nav-pause when backPath arrives.
+  final Map<int, void Function()> _thumbReleaseOnList = {};
+
+  bool get _thumbsBlocked => _thumbNavPause > 0 || _thumbScrollPaused;
+
+  void pauseThumbsForNav() {
+    _thumbNavPause++;
+  }
+
+  void resumeThumbsForNav() {
+    if (_thumbNavPause > 0) _thumbNavPause--;
+    if (!_thumbsBlocked) _pumpThumbQueue();
+  }
+
+  /// Call from the browser while the list/grid is scrolling.
+  void setThumbScrollPaused(bool paused) {
+    if (_thumbScrollPaused == paused) return;
+    _thumbScrollPaused = paused;
+    if (!paused) _pumpThumbQueue();
+  }
+
+  void _releaseThumbNavForList(int rpc) {
+    final rel = _thumbReleaseOnList.remove(rpc);
+    rel?.call();
+  }
 
   StreamSubscription<WebrpcDataEvent>? _dataSub;
   StreamSubscription<WebrpcFileChunkEvent>? _fileSub;
@@ -120,8 +193,13 @@ class DriveController extends ChangeNotifier {
   }
 
   Future<void> bindOwner(String ownerToken) async {
+    final next = ownerToken.trim();
+    // Recovery Login must not wipe in-memory sessions / break an open browser.
+    if (next.isNotEmpty && next == _ownerToken && _dataSub != null) {
+      return;
+    }
     await unbind();
-    _ownerToken = ownerToken.trim();
+    _ownerToken = next;
     loading = true;
     notifyListeners();
     try {
@@ -131,19 +209,21 @@ class DriveController extends ChangeNotifier {
       _dataSub = _webrpc.onData.listen(_onData);
       _fileSub = _webrpc.onFileChunk.listen(_onFileChunk);
       _statusSub = _webrpc.onStatus.listen((st) {
+        // Ignore connecting — silent webrpc recovery must not spam「请重新登录」.
+        if (st == WebrpcLoginState.connecting) return;
         if (st != WebrpcLoginState.online) {
           for (final s in sessions) {
             if (s.connected || s.connecting) {
               s.connected = false;
               s.connecting = false;
               s.rpcSessionId = 0;
-              s.connectError = '已离线，请重新登录后连接';
+              s.connectError = '连接已断开，请重新连接'.tr;
               s.listing = false;
             }
           }
           _pendingListPath.clear();
           _recv.clear();
-          _failAllWaiting('已离线');
+          _failAllWaiting('已离线'.tr);
           notifyListeners();
         }
       });
@@ -151,6 +231,16 @@ class DriveController extends ChangeNotifier {
       loading = false;
       notifyListeners();
     }
+  }
+
+  /// 退出并删除该 Token 在本机的网盘列表与缓存。
+  Future<void> wipeLocalData() async {
+    final owner = _ownerToken;
+    await unbind();
+    if (owner.isNotEmpty) {
+      await _store.wipeOwner(owner);
+    }
+    notifyListeners();
   }
 
   Future<void> unbind() async {
@@ -176,7 +266,7 @@ class DriveController extends ChangeNotifier {
     _recv.clear();
     _uploadBusy.clear();
     _downloadBusy.clear();
-    _failAllWaiting('已退出');
+    _failAllWaiting('已退出'.tr);
   }
 
   Future<DriveSession> createSession({
@@ -187,12 +277,12 @@ class DriveController extends ChangeNotifier {
     final peer = peerToken.trim();
     final pass = peerPass.trim();
     final note = remark.trim();
-    if (peer.isEmpty) throw StateError('请填写网盘 Token');
+    if (peer.isEmpty) throw StateError('请填写网盘 Token'.tr);
     if (peer == _ownerToken) {
-      throw StateError('不能使用当前登录 Token（webrpc 不支持自己连自己）');
+      throw StateError('不能使用当前登录 Token（webrpc 不支持自己连自己）'.tr);
     }
     if (sessions.any((s) => s.peerToken == peer)) {
-      throw StateError('该网盘已存在');
+      throw StateError('该网盘已存在'.tr);
     }
     final session = DriveSession(
       id: _uuid.v4(),
@@ -219,70 +309,107 @@ class DriveController extends ChangeNotifier {
 
   Future<void> connect(DriveSession session) async {
     if (!_webrpc.isOnline) {
-      session.connectError = '请先登录 webrpc';
+      session.connectError = '请先登录 webrpc'.tr;
       notifyListeners();
-      return;
+      throw StateError(session.connectError);
     }
     if (session.peerToken == _ownerToken) {
-      throw StateError('不能使用当前登录 Token（webrpc 不支持自己连自己）');
+      throw StateError('不能使用当前登录 Token（webrpc 不支持自己连自己）'.tr);
     }
     if (session.connecting || session.connected) return;
     session.connecting = true;
     session.connectError = '';
     notifyListeners();
     try {
-      final rpcId = _webrpc.openSession(
+      final rpcId = await _webrpc.openSessionAsync(
         session.peerToken,
         permission: session.peerPass,
       );
       if (rpcId == 0) {
-        throw StateError('连接失败（OpenSession=0），请检查网盘 Token、口令与在线状态');
+        throw StateError('连接失败（OpenSession=0），请检查网盘 Token、口令与在线状态'.tr);
       }
-      final helloOk = _webrpc.sendJson(rpcId, {
+      final helloOk = await _webrpc.sendJsonAsync(rpcId, {
         'type': 1,
         'data': {
           'sessionId': rpcId,
           'token': _webrpc.currentToken,
           'permission': _webrpc.currentPermission,
+          ...DriveProtocol.helloExtras(),
         },
-      }, timeoutMs: 10000);
+      }, timeoutMs: 3000);
       if (!helloOk) {
         _webrpc.closeSession(rpcId);
-        throw StateError('握手失败，请重试');
+        throw StateError('握手失败，请重试'.tr);
       }
       session.rpcSessionId = rpcId;
       session.connected = true;
       session.connecting = false;
-      session.currentPath = '/';
-      session.entries = [];
+      session.peerCapsResume = false;
+      session.peerDriveProto = 0;
+      final resumePath =
+          session.currentPath.isEmpty ? '/' : session.currentPath;
+      if (session.entries.isEmpty) {
+        session.currentPath = '/';
+      }
       await _persist();
       notifyListeners();
+      AppDebugLog.log(
+        'drive connect ok peer=${session.peerToken} rpc=$rpcId '
+        'callback=${_webrpc.callbackStatus}',
+      );
+      _ensureHeartbeat();
+      // Give the Go Accept goroutine a beat to publish receiveConn, then ask.
+      await Future<void>.delayed(const Duration(milliseconds: 200));
       requestNasInfo(session);
-      await listPath(session, '/');
+      await _waitPeerCaps(session);
+      await listPath(session, resumePath == '/' ? '/' : resumePath);
+      // If backPath never arrives (callback writer was nil), rebind + retry.
+      unawaited(_ensureListed(session, rpcId));
       unawaited(_pumpUploads(session));
       unawaited(_pumpDownloads(session));
     } catch (e) {
+      AppDebugLog.log('drive connect fail: $e');
       session.connecting = false;
       session.connected = false;
       session.rpcSessionId = 0;
-      session.connectError = e.toString();
+      session.connectError = userFacingError(
+        e,
+        fallback: '连接失败，请重试'.tr,
+      );
       notifyListeners();
       rethrow;
     }
   }
 
-  Future<void> disconnect(DriveSession session) async {
+  /// Tear down webrpc transport only — keep logical session + transfer queue.
+  Future<void> detachTransport(DriveSession session) async {
     final rpc = session.rpcSessionId;
     session.connected = false;
     session.connecting = false;
     session.rpcSessionId = 0;
     session.connectError = '';
     session.listing = false;
-    session.entries = [];
-    session.nasInfo = null;
     session.searching = false;
+    session.peerCapsResume = false;
+    _heartbeatMisses.remove(session.id);
+    // Re-queue in-flight work for resume after rebind (do not mark failed).
+    for (final t in session.transfers) {
+      if (t.status == DriveTransferStatus.running) {
+        t.status = DriveTransferStatus.queued;
+        t.error = '';
+        t.startedAt = null;
+      }
+    }
+    _dropThumbJobsForSession(session.id);
     if (rpc != 0) {
+      _releaseThumbNavForList(rpc);
       _pendingListPath.remove(rpc);
+      final lw = _listWait.remove(rpc);
+      if (lw != null && !lw.isCompleted) lw.complete(false);
+      final put = _putWait.remove(rpc);
+      if (put != null && !put.isCompleted) {
+        put.complete(_PutAck(written: 0, size: 0, ok: false, error: 'rebind'));
+      }
       _recv.removeWhere((k, _) => k.startsWith('$rpc::'));
       try {
         _webrpc.closeSession(rpc);
@@ -293,6 +420,98 @@ class DriveController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _ensureMediaProxy(DriveSession session) async {
+    if (session.rpcSessionId == 0) return;
+    final proxy = _mediaProxies.putIfAbsent(
+      session.id,
+      () => DriveMediaProxy(_webrpc),
+    );
+    await proxy.ensureStarted(session.rpcSessionId);
+    proxy.bindRpc(session.rpcSessionId);
+  }
+
+  Future<void> _stopMediaProxy(DriveSession session) async {
+    final proxy = _mediaProxies.remove(session.id);
+    await proxy?.stop();
+  }
+
+  /// HTTP stream URL for in-app video/audio preview (null if proxy not up).
+  String? mediaStreamUrl(
+    DriveSession session,
+    String remoteDir,
+    String fileName,
+  ) {
+    return _mediaProxies[session.id]?.streamUrl(remoteDir, fileName);
+  }
+
+  /// User-initiated disconnect — fail open transfers.
+  Future<void> disconnect(DriveSession session) async {
+    await _stopMediaProxy(session);
+    final rpc = session.rpcSessionId;
+    session.connected = false;
+    session.connecting = false;
+    session.rpcSessionId = 0;
+    session.connectError = '';
+    session.listing = false;
+    session.entries = [];
+    session.nasInfo = null;
+    session.searching = false;
+    session.peerCapsResume = false;
+    session.peerDriveProto = 0;
+    _heartbeatMisses.remove(session.id);
+    for (final t in session.transfers) {
+      if (t.status == DriveTransferStatus.running ||
+          t.status == DriveTransferStatus.queued) {
+        t.status = DriveTransferStatus.failed;
+        t.error = '连接已重置，请重试'.tr;
+      }
+    }
+    _dropThumbJobsForSession(session.id);
+    if (rpc != 0) {
+      _releaseThumbNavForList(rpc);
+      _pendingListPath.remove(rpc);
+      final lw = _listWait.remove(rpc);
+      if (lw != null && !lw.isCompleted) lw.complete(false);
+      _recv.removeWhere((k, _) => k.startsWith('$rpc::'));
+      try {
+        _webrpc.closeSession(rpc);
+      } catch (_) {}
+    }
+    _uploadBusy.remove(session.id);
+    _downloadBusy.remove(session.id);
+    notifyListeners();
+  }
+
+  void setAppForeground(bool foreground) {
+    _appForeground = foreground;
+    if (foreground) {
+      _ensureHeartbeat();
+    } else {
+      _stopHeartbeat();
+    }
+  }
+
+  void _dropThumbJobsForSession(String sessionId) {
+    bool drop(_ThumbJob j) => j.sessionId == sessionId;
+    _thumbHigh.removeWhere((j) {
+      if (!drop(j)) return false;
+      _thumbPending.remove(j.key);
+      return true;
+    });
+    _thumbLow.removeWhere((j) {
+      if (!drop(j)) return false;
+      _thumbPending.remove(j.key);
+      return true;
+    });
+    final prefix = '$sessionId::';
+    final keys = _thumbRpcWait.keys.where((k) => k.startsWith(prefix)).toList();
+    for (final k in keys) {
+      final c = _thumbRpcWait.remove(k);
+      if (c != null && !c.isCompleted) c.complete();
+      _thumbPending.remove(k);
+    }
+  }
+
   Future<void> deleteSession(DriveSession session) async {
     await disconnect(session);
     sessions.removeWhere((s) => s.id == session.id);
@@ -301,35 +520,259 @@ class DriveController extends ChangeNotifier {
     notifyListeners();
   }
 
+  Future<void> _waitPeerCaps(DriveSession session) async {
+    final deadline = DateTime.now().add(const Duration(seconds: 2));
+    while (DateTime.now().isBefore(deadline)) {
+      if (session.peerDriveProto > 0 || session.peerCapsResume) return;
+      await Future<void>.delayed(const Duration(milliseconds: 50));
+    }
+  }
+
   void requestNasInfo(DriveSession session) {
     if (!session.connected || session.rpcSessionId == 0) return;
     _webrpc.sendJson(session.rpcSessionId, {'type': 'getNasInfo'}, timeoutMs: 10000);
   }
 
   Future<void> listPath(DriveSession session, String path) async {
-    _ensureConnected(session);
-    final dir = normalizeNasPath(path);
-    session.listing = true;
-    session.listError = '';
-    session.listSeq += 1;
-    final seq = session.listSeq;
-    session.currentPath = dir;
-    _pendingListPath[session.rpcSessionId] = dir;
-    notifyListeners();
-    final ok = _webrpc.sendJson(
-      session.rpcSessionId,
-      {'type': 'getPath', 'data': dir},
-      timeoutMs: 15000,
+    await listPathAndWait(
+      session,
+      path,
+      timeout: const Duration(seconds: 15),
+      waitForResult: false,
     );
-    if (!ok && session.listSeq == seq) {
-      session.listing = false;
-      session.listError = '列目录超时，请重试';
+  }
+
+  /// Sends getPath. When [waitForResult] is true, waits for backPath (or timeout).
+  Future<bool> listPathAndWait(
+    DriveSession session,
+    String path, {
+    Duration timeout = const Duration(seconds: 8),
+    bool waitForResult = true,
+  }) async {
+    // Yield webrpc to directory navigation — thumbs resume when listing settles.
+    pauseThumbsForNav();
+    var released = false;
+    void release() {
+      if (released) return;
+      released = true;
+      resumeThumbsForNav();
+    }
+
+    try {
+      _ensureConnected(session);
+      final dir = normalizeNasPath(path);
+      final rpc = session.rpcSessionId;
+      session.listing = true;
+      session.listError = '';
+      session.listSeq += 1;
+      final seq = session.listSeq;
+      session.currentPath = dir;
+      _pendingListPath[rpc] = dir;
+      Completer<bool>? wait;
+      if (waitForResult) {
+        final prev = _listWait.remove(rpc);
+        if (prev != null && !prev.isCompleted) prev.complete(false);
+        wait = Completer<bool>();
+        _listWait[rpc] = wait;
+      }
       notifyListeners();
+      AppDebugLog.log(
+        'drive listPath rpc=$rpc path=$dir seq=$seq '
+        'callback=${_webrpc.callbackStatus}',
+      );
+      final ok = _webrpc.sendJson(
+        rpc,
+        {'type': 'getPath', 'data': dir},
+        timeoutMs: 15000,
+      );
+      if (!ok) {
+        AppDebugLog.log('drive listPath send failed path=$dir');
+        if (session.listSeq == seq) {
+          session.listing = false;
+          session.listError = '列目录超时，请重试'.tr;
+          notifyListeners();
+        }
+        final c = _listWait.remove(rpc);
+        if (c != null && !c.isCompleted) c.complete(false);
+        release();
+        return false;
+      }
+      if (wait == null) {
+        // Keep pause until backPath (or disconnect) so return/up stays snappy.
+        _thumbReleaseOnList[rpc] = release;
+        return true;
+      }
+      try {
+        final r = await wait.future.timeout(timeout);
+        release();
+        return r;
+      } on TimeoutException {
+        AppDebugLog.log('drive listPath wait timeout path=$dir rpc=$rpc');
+        if (session.listSeq == seq) {
+          session.listing = false;
+          if (session.listError.isEmpty) {
+            session.listError = '列目录超时，请重试'.tr;
+          }
+          notifyListeners();
+        }
+        final c = _listWait.remove(rpc);
+        if (c != null && !c.isCompleted) c.complete(false);
+        release();
+        return false;
+      }
+    } catch (e) {
+      release();
+      rethrow;
     }
   }
 
   Future<void> refresh(DriveSession session) =>
       listPath(session, session.currentPath);
+
+  /// Always tear down and open a fresh NAS rpc (even if UI says connected).
+  Future<void> forceReconnect(
+    DriveSession session, {
+    String? resumePath,
+  }) async {
+    final path = normalizeNasPath(
+      resumePath ?? (session.currentPath.isEmpty ? '/' : session.currentPath),
+    );
+    AppDebugLog.log('drive forceReconnect peer=${session.peerToken} path=$path');
+    if (path.isNotEmpty) session.currentPath = path;
+    await detachTransport(session);
+    await connect(session);
+    if (session.connected && path != '/') {
+      await listPathAndWait(session, path);
+    }
+  }
+
+  /// Seamless heal after background / lock (iOS + Android).
+  ///
+  /// Escalates to full webrpc Login when LoginStatus==0, OpenSession==0,
+  /// callback refused, or reconnect still cannot list (zombie LoginStatus=1).
+  Future<void> healAfterForeground(
+    DriveSession session, {
+    required Future<void> Function({bool forceRelogin}) ensureWebrpc,
+  }) async {
+    if (_healingSessionIds.contains(session.id)) return;
+    _healingSessionIds.add(session.id);
+    final path = session.currentPath.isEmpty ? '/' : session.currentPath;
+    AppDebugLog.log(
+      'drive heal start id=${session.id} connected=${session.connected} '
+      'entries=${session.entries.length} path=$path '
+      'nativeLogin=${_webrpc.nativeLoginAlive} '
+      'callback=${_webrpc.callbackStatus}',
+    );
+    try {
+      if (!session.connected && !session.connecting) {
+        session.connecting = true;
+        session.connectError = '';
+        notifyListeners();
+      }
+      // Soft: rebind, or full Login if callback port is dead.
+      await ensureWebrpc(forceRelogin: false);
+
+      if (session.connected) {
+        // Short soft probe — long waits make the UI feel frozen.
+        final ok = await listPathAndWait(
+          session,
+          path,
+          timeout: const Duration(milliseconds: 2500),
+        );
+        if (ok) {
+          AppDebugLog.log('drive heal: soft list ok');
+          return;
+        }
+      }
+
+      AppDebugLog.log('drive heal: forceReconnect');
+      var openSessionZero = false;
+      try {
+        await forceReconnect(session, resumePath: path);
+      } catch (e) {
+        openSessionZero = '$e'.contains('OpenSession=0') ||
+            '$e'.contains('连接失败');
+        AppDebugLog.log('drive heal: forceReconnect threw: $e');
+      }
+      if (!openSessionZero &&
+          session.connected &&
+          (session.entries.isNotEmpty ||
+              await listPathAndWait(
+                session,
+                path,
+                timeout: const Duration(seconds: 3),
+              ))) {
+        AppDebugLog.log('drive heal: reconnect ok');
+        return;
+      }
+
+      // Peer offline with healthy transport — do not full Login.
+      final transportSick =
+          !_webrpc.nativeLoginAlive || !_webrpc.isCallbackConnected;
+      if (openSessionZero && !transportSick) {
+        AppDebugLog.log('drive heal: stop (peer unreachable, transport ok)');
+        session.connecting = false;
+        if (session.connectError.isEmpty) {
+          session.connectError =
+              '无法连接对端，请确认对方在线、Token 与口令正确后重试'.tr;
+        }
+        notifyListeners();
+        return;
+      }
+
+      // Zombie webrpc: callback/login sick — full Login then reconnect.
+      AppDebugLog.log(
+        'drive heal: escalate full Login '
+        '(openSessionZero=$openSessionZero connected=${session.connected} '
+        'entries=${session.entries.length} callback=${_webrpc.callbackStatus})',
+      );
+      await ensureWebrpc(forceRelogin: true);
+      await forceReconnect(session, resumePath: path);
+      AppDebugLog.log(
+        'drive heal done connected=${session.connected} '
+        'entries=${session.entries.length} callback=${_webrpc.callbackStatus}',
+      );
+      if (!session.connected) {
+        session.connecting = false;
+        session.connectError = '连接已断开，请重新连接'.tr;
+        notifyListeners();
+      }
+    } catch (e, st) {
+      AppDebugLog.log('drive heal fail: $e\n$st');
+      final tip = userFacingError(e, fallback: '连接失败，请重试'.tr);
+      session.listError = tip;
+      session.connecting = false;
+      if (session.connectError.isEmpty) {
+        session.connectError = tip;
+      }
+      notifyListeners();
+      rethrow;
+    } finally {
+      if (!session.connected) session.connecting = false;
+      _healingSessionIds.remove(session.id);
+    }
+  }
+
+  /// Retries listing when the first getPath reply was dropped (callback writer nil).
+  Future<void> _ensureListed(DriveSession session, int rpcId) async {
+    for (var i = 0; i < 3; i++) {
+      await Future<void>.delayed(const Duration(seconds: 2));
+      if (session.rpcSessionId != rpcId || !session.connected) return;
+      if (session.entries.isNotEmpty) return;
+      AppDebugLog.log(
+        'drive list retry #${i + 1} rpc=$rpcId '
+        'callback=${_webrpc.callbackStatus} listing=${session.listing}',
+      );
+      await _webrpc.rebindCallback();
+      await Future<void>.delayed(const Duration(milliseconds: 150));
+      final ok = await listPathAndWait(
+        session,
+        session.currentPath.isEmpty ? '/' : session.currentPath,
+        timeout: const Duration(seconds: 5),
+      );
+      if (ok) return;
+    }
+  }
 
   Future<void> goUp(DriveSession session) =>
       listPath(session, parentNasPath(session.currentPath));
@@ -338,7 +781,7 @@ class DriveController extends ChangeNotifier {
     _ensureConnected(session);
     final n = name.trim().replaceAll(RegExp(r'[\\/\x00]'), '');
     if (n.isEmpty || n == '.' || n == '..' || n.startsWith('.')) {
-      throw StateError('文件夹名称无效');
+      throw StateError('文件夹名称无效'.tr);
     }
     final dir = session.currentPath;
     final key = 'create:${session.rpcSessionId}:$dir:$n';
@@ -354,7 +797,7 @@ class DriveController extends ChangeNotifier {
     );
     if (!ok) {
       _opWait.remove(key);
-      throw StateError('创建文件夹失败');
+      throw StateError('创建文件夹失败'.tr);
     }
     final success = await c.future.timeout(
       const Duration(seconds: 20),
@@ -363,7 +806,7 @@ class DriveController extends ChangeNotifier {
         return false;
       },
     );
-    if (!success) throw StateError('创建文件夹失败');
+    if (!success) throw StateError('创建文件夹失败'.tr);
     await refresh(session);
   }
 
@@ -376,7 +819,7 @@ class DriveController extends ChangeNotifier {
     final from = name.trim().replaceAll(RegExp(r'[\\/\x00]'), '');
     final to = newName.trim().replaceAll(RegExp(r'[\\/\x00]'), '');
     if (from.isEmpty || to.isEmpty || to.startsWith('.')) {
-      throw StateError('名称无效');
+      throw StateError('名称无效'.tr);
     }
     final dir = session.currentPath;
     final key = 'rename:${session.rpcSessionId}:$dir:$from';
@@ -394,7 +837,7 @@ class DriveController extends ChangeNotifier {
     );
     if (!ok) {
       _opWait.remove(key);
-      throw StateError('重命名失败');
+      throw StateError('重命名失败'.tr);
     }
     final success = await c.future.timeout(
       const Duration(seconds: 20),
@@ -403,7 +846,7 @@ class DriveController extends ChangeNotifier {
         return false;
       },
     );
-    if (!success) throw StateError('重命名失败');
+    if (!success) throw StateError('重命名失败'.tr);
     await refresh(session);
   }
 
@@ -429,7 +872,7 @@ class DriveController extends ChangeNotifier {
     );
     if (!ok) {
       _opWait.remove(key);
-      throw StateError('删除失败');
+      throw StateError('删除失败'.tr);
     }
     final success = await c.future.timeout(
       const Duration(seconds: 60),
@@ -438,7 +881,7 @@ class DriveController extends ChangeNotifier {
         return false;
       },
     );
-    if (!success) throw StateError('删除失败');
+    if (!success) throw StateError('删除失败'.tr);
     await refresh(session);
   }
 
@@ -456,7 +899,7 @@ class DriveController extends ChangeNotifier {
     if (cleaned.isEmpty) return;
     final from = normalizeNasPath(fromPath);
     final to = normalizeNasPath(targetPath);
-    if (to == from) throw StateError('目标目录与当前相同');
+    if (to == from) throw StateError('目标目录与当前相同'.tr);
     final key = 'move:${session.rpcSessionId}:$from:$to';
     final c = Completer<bool>();
     _opWait[key] = c;
@@ -472,7 +915,7 @@ class DriveController extends ChangeNotifier {
     );
     if (!ok) {
       _opWait.remove(key);
-      throw StateError('移动失败');
+      throw StateError('移动失败'.tr);
     }
     final success = await c.future.timeout(
       const Duration(seconds: 60),
@@ -481,7 +924,7 @@ class DriveController extends ChangeNotifier {
         return false;
       },
     );
-    if (!success) throw StateError('移动失败');
+    if (!success) throw StateError('移动失败'.tr);
     await listPath(session, from);
   }
 
@@ -507,7 +950,7 @@ class DriveController extends ChangeNotifier {
     );
     if (!ok) {
       session.searching = false;
-      session.searchError = '搜索超时';
+      session.searchError = '搜索超时'.tr;
       notifyListeners();
     }
   }
@@ -561,6 +1004,9 @@ class DriveController extends ChangeNotifier {
   ///
   /// When [forPreview] is true and a **new** task is created, closing the preview
   /// may cancel it via [releasePreviewDownload].
+  ///
+  /// Editable text always re-fetches from the NAS (no local cache hit) so App /
+  /// Desktop edits stay consistent on Android and iOS.
   Future<DriveTransfer> startDownload(
     DriveSession session,
     NasEntry entry, {
@@ -568,9 +1014,18 @@ class DriveController extends ChangeNotifier {
     bool forPreview = false,
   }) async {
     _ensureConnected(session);
-    if (entry.isDir) throw StateError('不能下载目录');
+    if (entry.isDir) throw StateError('不能下载目录'.tr);
     final dir = normalizeNasPath(remoteDir ?? session.currentPath);
     final name = safeFileName(entry.name);
+    final forceTextRefresh = entry.previewKind == DrivePreviewKind.text;
+    // Explicit user download of photos/videos → Photos album (not preview cache).
+    final saveAlbum = !forPreview &&
+        (entry.previewKind == DrivePreviewKind.image ||
+            entry.previewKind == DrivePreviewKind.video);
+
+    if (forceTextRefresh) {
+      await _invalidateLocalDownload(session, dir, name);
+    }
 
     final existing = session.findDownload(dir, name);
     if (existing != null) {
@@ -579,22 +1034,32 @@ class DriveController extends ChangeNotifier {
         if (entry.size > 0 && existing.size <= 0) existing.size = entry.size;
         // Shared with another opener — do not cancel when one preview closes.
         existing.cancelableByPreview = false;
+        if (saveAlbum) existing.saveMediaToAlbum = true;
         return existing;
       }
-      if (existing.status == DriveTransferStatus.done &&
+      if (!forceTextRefresh &&
+          existing.status == DriveTransferStatus.done &&
           await _isLocalComplete(existing, entry.size)) {
         if (entry.size > 0) existing.size = entry.size;
         existing.cancelableByPreview = false;
+        if (saveAlbum) {
+          existing.saveMediaToAlbum = true;
+          unawaited(_exportMediaToAlbumIfNeeded(existing));
+        }
         return existing;
       }
-      // Failed / cancelled / done-but-empty stub: reuse the same task slot.
+      // Failed / cancelled / done-but-stale (text) / empty stub: re-queue.
       if (existing.localPath.isNotEmpty) {
         try {
           final f = File(existing.localPath);
           if (await f.exists()) {
-            final len = await f.length();
-            final ok = entry.size > 0 ? len >= entry.size : len > 0;
-            if (!ok) await f.delete();
+            if (forceTextRefresh) {
+              await f.delete();
+            } else {
+              final len = await f.length();
+              final ok = entry.size > 0 ? len >= entry.size : len > 0;
+              if (!ok) await f.delete();
+            }
           }
         } catch (_) {}
       }
@@ -603,8 +1068,10 @@ class DriveController extends ChangeNotifier {
       existing.transferred = 0;
       existing.localPath = '';
       existing.error = '';
+      existing.resultNote = '';
       existing.cancelRequested = false;
       existing.cancelableByPreview = forPreview;
+      existing.saveMediaToAlbum = saveAlbum;
       existing.speedBps = 0;
       existing.startedAt = null;
       notifyListeners();
@@ -614,27 +1081,14 @@ class DriveController extends ChangeNotifier {
 
     // Only reuse orphan local files when listing size is known and matches.
     // size==0 in listings is common for txt; never treat empty stubs as complete.
-    if (entry.size > 0) {
+    // Text never reuses orphans — always fetch from server.
+    if (!forceTextRefresh && entry.size > 0) {
       final local =
           await _store.downloadPath(_ownerToken, session.peerToken, name);
       final localFile = File(local);
       if (await localFile.exists()) {
         final len = await localFile.length();
         if (len >= entry.size) {
-          if (existing != null &&
-              (existing.status == DriveTransferStatus.failed ||
-                  existing.status == DriveTransferStatus.cancelled ||
-                  existing.status == DriveTransferStatus.done)) {
-            existing.status = DriveTransferStatus.done;
-            existing.localPath = local;
-            existing.transferred = len;
-            existing.size = entry.size;
-            existing.error = '';
-            existing.cancelRequested = false;
-            existing.cancelableByPreview = false;
-            notifyListeners();
-            return existing;
-          }
           final done = DriveTransfer(
             id: _uuid.v4(),
             kind: DriveTransferKind.download,
@@ -644,9 +1098,11 @@ class DriveController extends ChangeNotifier {
             size: entry.size,
             transferred: len,
             localPath: local,
+            saveMediaToAlbum: saveAlbum,
           );
           session.transfers.insert(0, done);
           notifyListeners();
+          if (saveAlbum) unawaited(_exportMediaToAlbumIfNeeded(done));
           return done;
         }
       }
@@ -660,11 +1116,39 @@ class DriveController extends ChangeNotifier {
       status: DriveTransferStatus.queued,
       size: entry.size,
       cancelableByPreview: forPreview,
+      saveMediaToAlbum: saveAlbum,
     );
     session.transfers.insert(0, t);
     notifyListeners();
     unawaited(_pumpDownloads(session));
     return t;
+  }
+
+  /// Copy finished image/video into the system album (File2File).
+  Future<void> _exportMediaToAlbumIfNeeded(DriveTransfer t) async {
+    if (!t.saveMediaToAlbum) return;
+    if (t.status != DriveTransferStatus.done) return;
+    if (t.localPath.isEmpty) return;
+    final kind = drivePreviewKind(t.name);
+    if (kind != DrivePreviewKind.image && kind != DrivePreviewKind.video) {
+      return;
+    }
+    try {
+      await _mediaSave.savePathToAlbum(
+        t.localPath,
+        video: kind == DrivePreviewKind.video,
+      );
+      t.resultNote = '已保存到相册'.tr;
+      t.error = '';
+      notifyListeners();
+    } catch (e) {
+      AppDebugLog.log('drive album export failed: $e');
+      t.error = AppL10n.current.fill(
+        r'已下载，但保存相册失败：$e',
+        {r'$e': '$e'},
+      );
+      notifyListeners();
+    }
   }
 
   Future<DriveTransfer> downloadNow(
@@ -679,7 +1163,7 @@ class DriveController extends ChangeNotifier {
     }
     if (t.status == DriveTransferStatus.failed ||
         t.status == DriveTransferStatus.cancelled) {
-      throw StateError(t.error.isEmpty ? '下载失败' : t.error);
+      throw StateError(t.error.isEmpty ? '下载失败'.tr : t.error);
     }
     return t;
   }
@@ -701,14 +1185,14 @@ class DriveController extends ChangeNotifier {
     if (t.kind != DriveTransferKind.download) return;
     if (t.status == DriveTransferStatus.queued) {
       t.status = DriveTransferStatus.cancelled;
-      t.error = '已取消';
+      t.error = '已取消'.tr;
       t.cancelRequested = false;
       notifyListeners();
       return;
     }
     if (t.status != DriveTransferStatus.running) return;
     t.cancelRequested = true;
-    t.error = '已取消';
+    t.error = '已取消'.tr;
     String? recvKey;
     _RecvFile? recv;
     _recv.forEach((k, v) {
@@ -742,6 +1226,7 @@ class DriveController extends ChangeNotifier {
   }) async {
     _ensureConnected(session);
     final safe = safeFileName(name);
+    final dir = normalizeNasPath(remoteDir);
     final tmpDir = await _store.downloadDir(_ownerToken, session.peerToken);
     final tmp = File(p.join(tmpDir.path, '.$safe.edit'));
     await tmp.writeAsString(text, flush: true);
@@ -750,16 +1235,73 @@ class DriveController extends ChangeNotifier {
         session,
         localPath: tmp.path,
         name: safe,
-        remoteDir: normalizeNasPath(remoteDir),
+        remoteDir: dir,
       );
     } finally {
       try {
         await tmp.delete();
       } catch (_) {}
     }
-    if (normalizeNasPath(remoteDir) == session.currentPath) {
+    // Keep the official download cache in sync with what we just uploaded
+    // (next open still re-fetches; this avoids a stale hit if reuse ever changes).
+    await _writeTextDownloadCache(session, dir, safe, text);
+    if (dir == session.currentPath) {
       await refresh(session);
     }
+  }
+
+  Future<void> _invalidateLocalDownload(
+    DriveSession session,
+    String remoteDir,
+    String name,
+  ) async {
+    try {
+      final local =
+          await _store.downloadPath(_ownerToken, session.peerToken, name);
+      final f = File(local);
+      if (await f.exists()) await f.delete();
+    } catch (_) {}
+  }
+
+  Future<void> _writeTextDownloadCache(
+    DriveSession session,
+    String remoteDir,
+    String name,
+    String text,
+  ) async {
+    final dir = normalizeNasPath(remoteDir);
+    final safe = safeFileName(name);
+    final path =
+        await _store.downloadPath(_ownerToken, session.peerToken, safe);
+    final file = File(path);
+    await file.writeAsString(text, flush: true);
+    final len = await file.length();
+    final existing = session.findDownload(dir, safe);
+    if (existing != null) {
+      existing.status = DriveTransferStatus.done;
+      existing.localPath = path;
+      existing.size = len;
+      existing.transferred = len;
+      existing.error = '';
+      existing.cancelRequested = false;
+      existing.cancelableByPreview = false;
+      existing.speedBps = 0;
+    } else {
+      session.transfers.insert(
+        0,
+        DriveTransfer(
+          id: _uuid.v4(),
+          kind: DriveTransferKind.download,
+          name: safe,
+          remoteDir: dir,
+          status: DriveTransferStatus.done,
+          size: len,
+          transferred: len,
+          localPath: path,
+        ),
+      );
+    }
+    notifyListeners();
   }
 
   Future<void> retryTransfer(DriveSession session, DriveTransfer t) async {
@@ -818,7 +1360,19 @@ class DriveController extends ChangeNotifier {
     return _thumbFailed.contains(thumbCacheKey(session, remoteDir, name));
   }
 
-  /// Ask server for missing image/video thumbnails (idempotent, rate-limited by pending set).
+  void _scheduleThumbTick() {
+    _thumbNotifyDirty = true;
+    // Slightly longer coalesce — fewer Image rebuild waves while scrolling.
+    _thumbNotifyTimer ??= Timer(const Duration(milliseconds: 200), () {
+      _thumbNotifyTimer = null;
+      if (!_thumbNotifyDirty) return;
+      _thumbNotifyDirty = false;
+      thumbTick.value++;
+    });
+  }
+
+  /// Background enqueue for a whole directory (or search hits). Visible cells
+  /// call [prioritizeThumb] to jump the queue. Max [thumbMaxInFlight] in flight.
   void ensureThumbs(
     DriveSession session,
     Iterable<NasEntry> entries, {
@@ -826,62 +1380,181 @@ class DriveController extends ChangeNotifier {
   }) {
     if (!session.connected || session.rpcSessionId == 0) return;
     final dir = normalizeNasPath(remoteDir ?? session.currentPath);
-    for (final entry in entries) {
+    final list = entries is List<NasEntry> ? entries : entries.toList();
+    unawaited(_enqueueThumbsChunked(session, dir, list));
+  }
+
+  Future<void> _enqueueThumbsChunked(
+    DriveSession session,
+    String dir,
+    List<NasEntry> entries,
+  ) async {
+    const chunk = 64;
+    var added = false;
+    for (var i = 0; i < entries.length; i++) {
+      if (!session.connected) return;
+      final entry = entries[i];
       if (entry.isDir) continue;
       final kind = entry.previewKind;
       if (kind != DrivePreviewKind.image && kind != DrivePreviewKind.video) {
         continue;
       }
-      final key = thumbCacheKey(session, dir, entry.name);
-      if (_thumbPaths.containsKey(key) ||
-          _thumbPending.contains(key) ||
-          _thumbFailed.contains(key)) {
-        continue;
+      if (_enqueueThumb(session, dir, entry.name, high: false)) {
+        added = true;
       }
-      _thumbPending.add(key);
-      unawaited(_requestThumb(session, dir, entry.name, key));
+      if (i > 0 && i % chunk == 0) {
+        if (added) {
+          _pumpThumbQueue();
+          added = false;
+        }
+        // Yield so scroll/taps stay responsive while enqueueing thousands.
+        await Future<void>.delayed(Duration.zero);
+      }
+    }
+    if (added) _pumpThumbQueue();
+  }
+
+  /// Visible list/grid cell — bump this file to the front of the thumb queue.
+  void prioritizeThumb(
+    DriveSession session,
+    String remoteDir,
+    String name,
+  ) {
+    if (!session.connected || session.rpcSessionId == 0) return;
+    final kind = drivePreviewKind(name);
+    if (kind != DrivePreviewKind.image && kind != DrivePreviewKind.video) {
+      return;
+    }
+    final dir = normalizeNasPath(remoteDir);
+    final key = thumbCacheKey(session, dir, name);
+    if (_thumbPaths.containsKey(key) || _thumbFailed.contains(key)) return;
+
+    // Already waiting in high queue or in flight.
+    if (_thumbPending.contains(key)) {
+      final lowIdx = _thumbLow.indexWhere((j) => j.key == key);
+      if (lowIdx >= 0) {
+        final job = _thumbLow.removeAt(lowIdx);
+        _thumbHigh.add(job);
+        _pumpThumbQueue();
+      }
+      return;
+    }
+    if (_enqueueThumb(session, dir, name, high: true)) {
+      _pumpThumbQueue();
     }
   }
 
-  Future<void> _requestThumb(
+  bool _enqueueThumb(
     DriveSession session,
     String dir,
-    String name,
-    String key,
-  ) async {
+    String name, {
+    required bool high,
+  }) {
+    final key = thumbCacheKey(session, dir, name);
+    if (_thumbPaths.containsKey(key) ||
+        _thumbPending.contains(key) ||
+        _thumbFailed.contains(key)) {
+      return false;
+    }
+    _thumbPending.add(key);
+    final job = _ThumbJob(
+      sessionId: session.id,
+      peerToken: session.peerToken,
+      dir: dir,
+      name: safeFileName(name),
+      key: key,
+    );
+    if (high) {
+      _thumbHigh.add(job);
+    } else {
+      _thumbLow.add(job);
+    }
+    return true;
+  }
+
+  void _pumpThumbQueue() {
+    // Do not start new thumb RPCs while navigating or scrolling — frees webrpc
+    // for getPath and keeps the UI thread from decoding a flood of JPEGs.
+    if (_thumbsBlocked) return;
+    while (_thumbInFlight < thumbMaxInFlight) {
+      final job = _thumbHigh.isNotEmpty
+          ? _thumbHigh.removeAt(0)
+          : (_thumbLow.isNotEmpty ? _thumbLow.removeAt(0) : null);
+      if (job == null) return;
+      _thumbInFlight++;
+      unawaited(() async {
+        try {
+          await _runThumbJob(job);
+        } finally {
+          _thumbInFlight--;
+          _pumpThumbQueue();
+        }
+      }());
+    }
+  }
+
+  Future<void> _runThumbJob(_ThumbJob job) async {
+    final session = sessionById(job.sessionId);
+    if (session == null || !session.connected || session.rpcSessionId == 0) {
+      _thumbPending.remove(job.key);
+      return;
+    }
     try {
       final cached = await _store.thumbPath(
         _ownerToken,
-        session.peerToken,
-        dir,
-        name,
+        job.peerToken,
+        job.dir,
+        job.name,
         edge: thumbEdge,
       );
-      if (await File(cached).exists() && await File(cached).length() > 0) {
-        _thumbPaths[key] = cached;
-        _thumbPending.remove(key);
-        notifyListeners();
+      final f = File(cached);
+      if (await f.exists() && await f.length() > 0) {
+        _thumbPaths[job.key] = cached;
+        _thumbPending.remove(job.key);
+        _scheduleThumbTick();
         return;
       }
     } catch (_) {}
-    if (!session.connected || session.rpcSessionId == 0) {
-      _thumbPending.remove(key);
+
+    // If UI asked us to yield the channel, put the job back and exit.
+    if (_thumbsBlocked) {
+      _thumbHigh.insert(0, job);
       return;
     }
+
+    // Leaving a folder must NOT cancel — keep downloading into cache as long
+    // as this drive session is still connected.
+    final live = sessionById(job.sessionId);
+    if (live == null || !live.connected || live.rpcSessionId == 0) {
+      _thumbPending.remove(job.key);
+      return;
+    }
+    final wait = Completer<void>();
+    _thumbRpcWait[job.key] = wait;
     final ok = _webrpc.sendJson(
-      session.rpcSessionId,
+      live.rpcSessionId,
       {
         'type': 'getThumb',
-        'fileName': name,
-        'filePath': dir,
+        'fileName': job.name,
+        'filePath': job.dir,
         'maxEdge': thumbEdge,
       },
-      timeoutMs: 15000,
+      timeoutMs: 20000,
     );
     if (!ok) {
-      _thumbPending.remove(key);
-      _thumbFailed.add(key);
-      notifyListeners();
+      _thumbRpcWait.remove(job.key);
+      _thumbPending.remove(job.key);
+      _thumbFailed.add(job.key);
+      _scheduleThumbTick();
+      return;
+    }
+    try {
+      await wait.future.timeout(const Duration(seconds: 25));
+    } on TimeoutException {
+      _thumbRpcWait.remove(job.key);
+      _thumbPending.remove(job.key);
+      _thumbFailed.add(job.key);
+      _scheduleThumbTick();
     }
   }
 
@@ -905,19 +1578,22 @@ class DriveController extends ChangeNotifier {
     final dir = normalizeNasPath('${json['filePath'] ?? session.currentPath}');
     if (name.isEmpty) return;
     final key = thumbCacheKey(session, dir, name);
+    final wait = _thumbRpcWait.remove(key);
+    if (wait != null && !wait.isCompleted) wait.complete();
     _thumbPending.remove(key);
     final ok = json['ok'] == true;
     final dataB64 = '${json['data'] ?? ''}';
     if (!ok || dataB64.isEmpty) {
       _thumbFailed.add(key);
-      notifyListeners();
+      _scheduleThumbTick();
       return;
     }
     try {
-      final bytes = base64Decode(dataB64);
+      // Off main isolate — large dirs flood base64 payloads otherwise.
+      final bytes = await compute(_decodeThumbB64, dataB64);
       if (bytes.isEmpty) {
         _thumbFailed.add(key);
-        notifyListeners();
+        _scheduleThumbTick();
         return;
       }
       final path = await _store.thumbPath(
@@ -927,13 +1603,13 @@ class DriveController extends ChangeNotifier {
         name,
         edge: thumbEdge,
       );
-      await File(path).writeAsBytes(bytes, flush: true);
+      await File(path).writeAsBytes(bytes, flush: false);
       _thumbPaths[key] = path;
       _thumbFailed.remove(key);
-      notifyListeners();
+      _scheduleThumbTick();
     } catch (_) {
       _thumbFailed.add(key);
-      notifyListeners();
+      _scheduleThumbTick();
     }
   }
 
@@ -988,7 +1664,7 @@ class DriveController extends ChangeNotifier {
       _ensureConnected(session);
       final path = t.localPath;
       if (path.isEmpty || !await File(path).exists()) {
-        throw StateError('本地文件不存在');
+        throw StateError('本地文件不存在'.tr);
       }
       await _putLocalFile(
         session,
@@ -1007,8 +1683,14 @@ class DriveController extends ChangeNotifier {
         await refresh(session);
       }
     } catch (e) {
-      t.status = DriveTransferStatus.failed;
-      t.error = e.toString();
+      final msg = e.toString();
+      if (msg.contains('连接已重建') || msg.contains('rebind')) {
+        t.status = DriveTransferStatus.queued;
+        t.error = '';
+      } else {
+        t.status = DriveTransferStatus.failed;
+        t.error = msg;
+      }
       notifyListeners();
     }
   }
@@ -1016,7 +1698,7 @@ class DriveController extends ChangeNotifier {
   Future<void> _runDownload(DriveSession session, DriveTransfer t) async {
     if (t.cancelRequested || t.status == DriveTransferStatus.cancelled) {
       t.status = DriveTransferStatus.cancelled;
-      t.error = t.error.isEmpty ? '已取消' : t.error;
+      t.error = t.error.isEmpty ? '已取消'.tr : t.error;
       notifyListeners();
       return;
     }
@@ -1034,6 +1716,7 @@ class DriveController extends ChangeNotifier {
       );
       t.localPath = local;
       final f = File(local);
+      var offset = 0;
       if (await f.exists()) {
         final len = await f.length();
         // Only skip network when listing size is known and local file matches.
@@ -1043,33 +1726,43 @@ class DriveController extends ChangeNotifier {
           notifyListeners();
           return;
         }
-        await f.delete();
+        if (session.peerCapsResume && len > 0 && (t.size <= 0 || len < t.size)) {
+          offset = len;
+          t.transferred = len;
+        } else {
+          await f.delete();
+          offset = 0;
+        }
       }
       // IMPORTANT: size==0 often means "unknown" (common for txt), NOT empty.
       // Always request getFile; completion comes from chunks / backFile.
       if (t.cancelRequested) {
         t.status = DriveTransferStatus.cancelled;
-        t.error = '已取消';
+        t.error = '已取消'.tr;
         notifyListeners();
         return;
       }
       final key = '${session.rpcSessionId}::${t.name}';
       final done = Completer<bool>();
-      _recv[key] = _RecvFile(transferId: t.id, path: local, size: t.size);
+      final recv = _RecvFile(transferId: t.id, path: local, size: t.size)
+        ..bytes = offset;
+      _recv[key] = recv;
       _opWait['dl:${t.id}'] = done;
+      final req = <String, dynamic>{
+        'type': 'getFile',
+        'fileName': t.name,
+        'filePath': t.remoteDir,
+      };
+      if (offset > 0) req['offset'] = offset;
       final ok = _webrpc.sendJson(
         session.rpcSessionId,
-        {
-          'type': 'getFile',
-          'fileName': t.name,
-          'filePath': t.remoteDir,
-        },
+        req,
         timeoutMs: 15000,
       );
       if (!ok) {
         _recv.remove(key);
         _opWait.remove('dl:${t.id}');
-        throw StateError('请求下载失败');
+        throw StateError('请求下载失败'.tr);
       }
       final waitSeconds = t.size > 0
           ? (t.size / 1024).clamp(60, 3600).toInt()
@@ -1084,13 +1777,13 @@ class DriveController extends ChangeNotifier {
       );
       if (t.cancelRequested || t.status == DriveTransferStatus.cancelled) {
         t.status = DriveTransferStatus.cancelled;
-        t.error = '已取消';
+        t.error = '已取消'.tr;
         notifyListeners();
         return;
       }
       if (!success && t.status != DriveTransferStatus.done) {
         final detail = t.error.trim();
-        throw StateError(detail.isEmpty ? '下载超时或失败' : detail);
+        throw StateError(detail.isEmpty ? '下载超时或失败'.tr : detail);
       }
       if (t.status == DriveTransferStatus.running) {
         t.status = DriveTransferStatus.done;
@@ -1099,7 +1792,10 @@ class DriveController extends ChangeNotifier {
     } catch (e) {
       if (t.cancelRequested || t.status == DriveTransferStatus.cancelled) {
         t.status = DriveTransferStatus.cancelled;
-        t.error = '已取消';
+        t.error = '已取消'.tr;
+      } else if (!session.connected || session.rpcSessionId == 0) {
+        t.status = DriveTransferStatus.queued;
+        t.error = '';
       } else {
         t.status = DriveTransferStatus.failed;
         t.error = e.toString();
@@ -1110,15 +1806,21 @@ class DriveController extends ChangeNotifier {
 
   void _ensureConnected(DriveSession session) {
     if (!session.connected || session.rpcSessionId == 0) {
-      throw StateError('网盘未连接');
+      throw StateError('网盘未连接'.tr);
     }
     if (!_webrpc.isOnline) {
-      throw StateError('webrpc 未登录');
+      throw StateError('webrpc 未登录'.tr);
     }
   }
 
   void _onData(WebrpcDataEvent event) {
-    if (!ownsRpc(event.sessionId)) return;
+    if (!ownsRpc(event.sessionId)) {
+      AppDebugLog.log(
+        'drive drop rpc=${event.sessionId} not owned '
+        'have=${sessions.map((s) => s.rpcSessionId).toList()}',
+      );
+      return;
+    }
     final bytes = event.bytes;
     if (bytes.length >= 4 && bytes[0] == 0 && bytes[1] == 0 && bytes[2] == 0) {
       return;
@@ -1128,22 +1830,55 @@ class DriveController extends ChangeNotifier {
       final decoded = jsonDecode(utf8.decode(bytes));
       if (decoded is! Map) return;
       json = Map<String, dynamic>.from(decoded);
-    } catch (_) {
+    } catch (e) {
+      AppDebugLog.log('drive json fail rpc=${event.sessionId}: $e');
       return;
     }
     final type = json['type'];
-    if (type is! String) return;
     final session = sessionByRpc(event.sessionId);
     if (session == null) return;
+    // Desktop on_upload_ack: numeric type=4 carries mid-upload byte progress.
+    if (type == 4) {
+      final data = json['data'];
+      if (data is Map) {
+        _onUploadProgressAck(session, Map<String, dynamic>.from(data));
+      }
+      return;
+    }
+    if (type == DriveProtocol.ping) {
+      final data = json['data'];
+      final t = data is Map
+          ? ((data['t'] as num?)?.toInt() ??
+              DateTime.now().millisecondsSinceEpoch)
+          : DateTime.now().millisecondsSinceEpoch;
+      _webrpc.sendJson(session.rpcSessionId, {
+        'type': DriveProtocol.pong,
+        'data': DriveProtocol.pongPayload(t),
+      }, timeoutMs: 0);
+      return;
+    }
+    if (type == DriveProtocol.pong) {
+      _heartbeatMisses[session.id] = 0;
+      return;
+    }
+    if (type is! String) {
+      return;
+    }
     switch (type) {
       case 'backNasInfo':
         final data = json['data'];
         if (data is Map) {
           session.nasInfo = NasInfo.fromJson(Map<String, dynamic>.from(data));
-          notifyListeners();
         }
+        session.peerDriveProto = (json['driveProto'] as num?)?.toInt() ?? 0;
+        session.peerCapsResume = DriveProtocol.capsIncludeResume(json['caps']);
+        notifyListeners();
         break;
       case 'backPath':
+        AppDebugLog.log(
+          'drive backPath rpc=${event.sessionId} '
+          'keys=${json.keys.join(",")}',
+        );
         _onBackPath(session, json);
         break;
       case 'backPut':
@@ -1155,6 +1890,12 @@ class DriveController extends ChangeNotifier {
       case 'backFile':
         // Must await pending chunk writes; otherwise small files finish as 0 bytes.
         unawaited(_onBackFile(session, json));
+        break;
+      case 'backStat':
+        _mediaProxies[session.id]?.onBackStat(json);
+        break;
+      case 'backRange':
+        _mediaProxies[session.id]?.onBackRange(json);
         break;
       case 'backCreateFile':
         _completeOp(
@@ -1212,6 +1953,28 @@ class DriveController extends ChangeNotifier {
     _opWait.clear();
   }
 
+  void _onUploadProgressAck(DriveSession session, Map<String, dynamic> data) {
+    final name = safeFileName('${data['fileName'] ?? ''}');
+    final bytes = _jsonInt(data['bytes']);
+    if (bytes <= 0) return;
+    for (final t in session.transfers) {
+      if (t.kind != DriveTransferKind.upload ||
+          t.status != DriveTransferStatus.running) {
+        continue;
+      }
+      if (name.isNotEmpty && t.name != name) continue;
+      if (bytes >= t.transferred) t.transferred = bytes;
+      final started = t.startedAt;
+      if (started != null && t.transferred > 0) {
+        final ms =
+            DateTime.now().difference(started).inMilliseconds.clamp(1, 1 << 30);
+        t.speedBps = t.transferred * 1000 ~/ ms;
+      }
+      notifyListeners();
+      break;
+    }
+  }
+
   void _onBackPut(DriveSession session, Map<String, dynamic> json) {
     final written = _jsonInt(json['written']);
     final size = _jsonInt(json['size']);
@@ -1224,11 +1987,11 @@ class DriveController extends ChangeNotifier {
         continue;
       }
       if (size > 0) t.size = size;
-      t.transferred = written;
+      if (written >= t.transferred) t.transferred = written;
       final started = t.startedAt;
-      if (started != null && written > 0) {
+      if (started != null && t.transferred > 0) {
         final ms = DateTime.now().difference(started).inMilliseconds.clamp(1, 1 << 30);
-        t.speedBps = written * 1000 ~/ ms;
+        t.speedBps = t.transferred * 1000 ~/ ms;
       }
       break;
     }
@@ -1282,9 +2045,17 @@ class DriveController extends ChangeNotifier {
     session.entries = entries;
     session.listing = false;
     session.listError = '';
+    final lw = _listWait.remove(session.rpcSessionId);
+    if (lw != null && !lw.isCompleted) lw.complete(true);
+    _releaseThumbNavForList(session.rpcSessionId);
+    // First successful listing → start (or keep) local HTTP media proxy.
+    unawaited(_ensureMediaProxy(session));
     notifyListeners();
-    // Prefetch thumbs for media in this directory (server generates/caches).
-    ensureThumbs(session, entries);
+    // Prefetch after first frame so the list stays interactive.
+    final snap = List<NasEntry>.from(entries);
+    unawaited(Future<void>.delayed(Duration.zero, () {
+      if (session.connected) ensureThumbs(session, snap);
+    }));
   }
 
   Future<void> _putLocalFile(
@@ -1297,26 +2068,32 @@ class DriveController extends ChangeNotifier {
     final size = await File(localPath).length();
     final dir = normalizeNasPath(remoteDir);
     final rpc = session.rpcSessionId;
+    var offset = 0;
     if (task != null) {
       task.size = size;
-      task.transferred = 0;
+      if (session.peerCapsResume &&
+          task.transferred > 0 &&
+          task.transferred < size) {
+        offset = task.transferred;
+      } else {
+        task.transferred = 0;
+        offset = 0;
+      }
       notifyListeners();
     }
     final ackWait = Completer<_PutAck>();
     _putWait[rpc] = ackWait;
-    final announced = _webrpc.sendJson(
-      rpc,
-      {
-        'type': 'putFile',
-        'fileName': name,
-        'filePath': dir,
-        'size': size,
-      },
-      timeoutMs: 15000,
-    );
+    final putBody = <String, dynamic>{
+      'type': 'putFile',
+      'fileName': name,
+      'filePath': dir,
+      'size': size,
+    };
+    if (offset > 0) putBody['offset'] = offset;
+    final announced = _webrpc.sendJson(rpc, putBody, timeoutMs: 15000);
     if (!announced) {
       _putWait.remove(rpc);
-      throw StateError('上传宣告失败');
+      throw StateError('上传宣告失败'.tr);
     }
     Timer? tick;
     if (task != null) {
@@ -1329,32 +2106,54 @@ class DriveController extends ChangeNotifier {
         notifyListeners();
       });
     }
+    String? slicePath;
     try {
       if (size > 0) {
         await Future<void>.delayed(const Duration(milliseconds: 80));
-        await _webrpc.sendFileAsync(rpc, localPath);
+        var sendPath = localPath;
+        if (offset > 0) {
+          slicePath = await _sliceFileFromOffset(localPath, offset);
+          sendPath = slicePath;
+        }
+        // pthread SendFile — UI isolate stays free for backPut progress ticks.
+        await _webrpc.sendFileAsync(rpc, sendPath);
       }
     } finally {
       tick?.cancel();
+      if (slicePath != null) {
+        try {
+          await File(slicePath).delete();
+        } catch (_) {}
+      }
     }
+    // Match Desktop confirm_put: scale wait with file size (cap 10 min).
+    final waitSecs = (60 + size ~/ (2 * 1024 * 1024)).clamp(60, 600);
     final ack = ackWait.isCompleted
         ? await ackWait.future
         : await ackWait.future.timeout(
-            const Duration(seconds: 30),
+            Duration(seconds: waitSecs),
             onTimeout: () {
               _putWait.remove(rpc);
               return _PutAck(
                 written: task?.transferred ?? 0,
                 size: size,
                 ok: false,
-                error: '上传未确认完成',
+                error: '上传未确认完成'.tr,
               );
             },
           );
+    if (ack.error == 'rebind') {
+      if (task != null && ack.written > 0) task.transferred = ack.written;
+      throw StateError('连接已重建，将自动续传'.tr);
+    }
     if (!ack.ok || ack.written != size) {
-      await _deleteRemoteQuiet(session, dir, name);
-      final why = ack.error.isEmpty ? '字节数不一致' : ack.error;
-      throw StateError('上传校验失败: $why');
+      if (!(session.peerCapsResume && ack.written > 0 && ack.written < size)) {
+        await _deleteRemoteQuiet(session, dir, name);
+      } else if (task != null) {
+        task.transferred = ack.written;
+      }
+      final why = ack.error.isEmpty ? '字节数不一致'.tr : ack.error;
+      throw StateError(AppL10n.current.fill(r'上传校验失败: $why', {r'$why': why}));
     }
     Object? listErr;
     for (var i = 0; i < 4; i++) {
@@ -1367,16 +2166,19 @@ class DriveController extends ChangeNotifier {
           if (task != null) task.transferred = size;
           return;
         }
-        listErr = StateError('目录大小 $listed 与本地 $size 不一致');
+        listErr = StateError(AppL10n.current.fill(r'目录大小 $listed 与本地 $size 不一致', {r'$listed': '$listed', r'$size': '$size'}));
       } catch (e) {
         listErr = e;
       }
     }
     final msg = '$listErr';
-    if (!msg.contains('超时')) {
+    // Match both the Chinese source and the English translation.
+    final timedOut =
+        msg.contains('超时') || msg.toLowerCase().contains('timed out');
+    if (!timedOut) {
       await _deleteRemoteQuiet(session, dir, name);
     }
-    throw StateError('目录核对失败: $msg');
+    throw StateError(AppL10n.current.fill(r'目录核对失败: $msg', {r'$msg': msg}));
   }
 
   Future<int> _listedSize(DriveSession session, String dir, String name) async {
@@ -1390,19 +2192,19 @@ class DriveController extends ChangeNotifier {
     );
     if (!ok) {
       _verifyList.remove(rpc);
-      throw StateError('目录核对超时');
+      throw StateError('目录核对超时'.tr);
     }
     final entries = await wait.future.timeout(
       const Duration(seconds: 20),
       onTimeout: () {
         _verifyList.remove(rpc);
-        throw StateError('目录核对超时');
+        throw StateError('目录核对超时'.tr);
       },
     );
     for (final entry in entries) {
       if (!entry.isDir && entry.name == name) return entry.size;
     }
-    throw StateError('目录中没有该文件');
+    throw StateError('目录中没有该文件'.tr);
   }
 
   Future<void> _deleteRemoteQuiet(DriveSession session, String dir, String name) async {
@@ -1495,21 +2297,21 @@ class DriveController extends ChangeNotifier {
 
     if (t.cancelRequested || t.status == DriveTransferStatus.cancelled) {
       t.status = DriveTransferStatus.cancelled;
-      t.error = '已取消';
+      t.error = '已取消'.tr;
     } else if (!ok) {
       t.status = DriveTransferStatus.failed;
       if (error.isNotEmpty) {
         t.error = error;
       } else if (bytes <= 0) {
-        t.error = '未收到文件数据（0 字节）';
+        t.error = '未收到文件数据（0 字节）'.tr;
       } else if (recv.size > 0 && bytes < recv.size) {
-        t.error = '下载未收齐（$bytes / ${recv.size}）';
+        t.error = AppL10n.current.fill(r'下载未收齐（$bytes / ${recv.size}）', {r'$bytes': '$bytes', r'${recv.size}': '${recv.size}'});
       } else {
-        t.error = '下载失败';
+        t.error = '下载失败'.tr;
       }
     } else if (bytes <= 0 && recv.size > 0) {
       t.status = DriveTransferStatus.failed;
-      t.error = '未收到文件数据（0 字节）';
+      t.error = '未收到文件数据（0 字节）'.tr;
     } else {
       t.status = DriveTransferStatus.done;
       t.error = '';
@@ -1525,6 +2327,9 @@ class DriveController extends ChangeNotifier {
       c.complete(t.status == DriveTransferStatus.done);
     }
     notifyListeners();
+    if (t.status == DriveTransferStatus.done) {
+      unawaited(_exportMediaToAlbumIfNeeded(t));
+    }
   }
 
   /// After `backFile`: poll local cache until size matches or length stabilizes.
@@ -1602,8 +2407,8 @@ class DriveController extends ChangeNotifier {
       error: ok
           ? ''
           : (expected > 0
-              ? '下载未收齐（$bytes / $expected）'
-              : '下载超时或失败'),
+              ? AppL10n.current.fill(r'下载未收齐（$bytes / $expected）', {r'$bytes': '$bytes', r'$expected': '$expected'})
+              : '下载超时或失败'.tr),
     );
   }
 
@@ -1629,7 +2434,7 @@ class DriveController extends ChangeNotifier {
 
   void _onBackSearch(DriveSession session, Map<String, dynamic> json) {
     session.searching = false;
-    session.searchError = json['ok'] == false ? '搜索失败' : '';
+    session.searchError = json['ok'] == false ? '搜索失败'.tr : '';
     session.searchTruncated = json['truncated'] == true;
     final results = <NasSearchHit>[];
     final arr = json['results'];
@@ -1675,7 +2480,7 @@ class DriveController extends ChangeNotifier {
         final c = _opWait.remove('dl:${t.id}');
         if (c != null && !c.isCompleted) c.complete(false);
         t.status = DriveTransferStatus.cancelled;
-        t.error = '已取消';
+        t.error = '已取消'.tr;
         notifyListeners();
         return;
       }
@@ -1710,6 +2515,76 @@ class DriveController extends ChangeNotifier {
       if (!gate.isCompleted) gate.complete();
       if (identical(_chunkWriteChain[key], gate.future)) {
         _chunkWriteChain.remove(key);
+      }
+    }
+  }
+
+  Future<String> _sliceFileFromOffset(String path, int offset) async {
+    final src = File(path);
+    final total = await src.length();
+    if (offset <= 0 || offset >= total) return path;
+    final dir = await _store.downloadDir(_ownerToken, '_tmp');
+    final out = File(
+      p.join(dir.path, 'put-slice-${_uuid.v4()}${p.extension(path)}'),
+    );
+    final raf = await src.open();
+    try {
+      await raf.setPosition(offset);
+      final sink = out.openWrite();
+      try {
+        while (true) {
+          final chunk = await raf.read(1024 * 1024);
+          if (chunk.isEmpty) break;
+          sink.add(chunk);
+        }
+      } finally {
+        await sink.close();
+      }
+    } finally {
+      await raf.close();
+    }
+    return out.path;
+  }
+
+  void _ensureHeartbeat() {
+    if (!_appForeground) return;
+    if (_heartbeatTimer != null) return;
+    _heartbeatTimer = Timer.periodic(DriveProtocol.heartbeatInterval, (_) {
+      unawaited(_tickHeartbeat());
+    });
+  }
+
+  void _stopHeartbeat() {
+    _heartbeatTimer?.cancel();
+    _heartbeatTimer = null;
+  }
+
+  Future<void> _tickHeartbeat() async {
+    if (!_appForeground || !_webrpc.isOnline) return;
+    final connected =
+        sessions.where((s) => s.connected && s.rpcSessionId != 0).toList();
+    if (connected.isEmpty) {
+      _stopHeartbeat();
+      return;
+    }
+    for (final session in connected) {
+      final t = DateTime.now().millisecondsSinceEpoch;
+      _webrpc.sendJson(session.rpcSessionId, {
+        'type': DriveProtocol.ping,
+        'data': DriveProtocol.pingPayload(t),
+      }, timeoutMs: 0);
+      final misses = (_heartbeatMisses[session.id] ?? 0) + 1;
+      _heartbeatMisses[session.id] = misses;
+      if (misses >= DriveProtocol.heartbeatMissLimit) {
+        AppDebugLog.log(
+          'drive heartbeat: ${session.id} missed $misses → reconnect',
+        );
+        _heartbeatMisses[session.id] = 0;
+        try {
+          await forceReconnect(session);
+        } catch (e) {
+          AppDebugLog.log('drive heartbeat reconnect failed: $e');
+        }
       }
     }
   }

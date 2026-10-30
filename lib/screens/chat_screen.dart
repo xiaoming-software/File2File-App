@@ -1,5 +1,7 @@
+import 'dart:async';
 import 'dart:io';
 
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -9,10 +11,13 @@ import 'package:open_filex/open_filex.dart';
 import 'package:provider/provider.dart';
 
 import '../models/chat_models.dart';
+import '../services/auth_controller.dart';
 import '../services/chat_controller.dart';
 import '../services/media_save_service.dart';
 import '../services/voice_controller.dart';
 import '../theme/app_theme.dart';
+import '../utils/app_snack.dart';
+import '../widgets/message_visibility.dart';
 
 class ChatScreen extends StatefulWidget {
   const ChatScreen({super.key, required this.sessionId});
@@ -22,18 +27,144 @@ class ChatScreen extends StatefulWidget {
   State<ChatScreen> createState() => _ChatScreenState();
 }
 
-class _ChatScreenState extends State<ChatScreen> {
+class _ChatScreenState extends State<ChatScreen> with WidgetsBindingObserver {
   final _textCtrl = TextEditingController();
   final _scroll = ScrollController();
   final _picker = ImagePicker();
   final _saver = MediaSaveService();
   bool _busy = false;
 
+  /// WeChat-like: auto-stick to bottom only when already near the end.
+  static const double _nearBottomSlop = 96;
+  bool _nearBottom = true;
+  bool _showNewMsgTip = false;
+  bool _scrollBootstrapped = false;
+  String? _lastHandledMsgId;
+  int _lastMsgCount = 0;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addObserver(this);
+    _scroll.addListener(_onScrollPosition);
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_healAfterForeground());
+    });
+  }
+
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _scroll.removeListener(_onScrollPosition);
     _textCtrl.dispose();
     _scroll.dispose();
     super.dispose();
+  }
+
+  void _onScrollPosition() {
+    if (!_scroll.hasClients) return;
+    final pos = _scroll.position;
+    final near = pos.maxScrollExtent - pos.pixels <= _nearBottomSlop;
+    if (near == _nearBottom && !(near && _showNewMsgTip)) {
+      if (near) _markSeenIfNearBottom();
+      return;
+    }
+    setState(() {
+      _nearBottom = near;
+      if (near) _showNewMsgTip = false;
+    });
+    if (near) _markSeenIfNearBottom();
+  }
+
+  void _markSeenIfNearBottom() {
+    if (!_isNearBottom()) return;
+    final chat = context.read<ChatController>();
+    final session = _session(chat);
+    if (session == null) return;
+    chat.markAllUnseenPeerMessages(session);
+  }
+
+  bool _isNearBottom() {
+    if (!_scroll.hasClients) return _nearBottom;
+    final pos = _scroll.position;
+    return pos.maxScrollExtent - pos.pixels <= _nearBottomSlop;
+  }
+
+  /// Stick to latest when near bottom / own send; else show「有新消息」.
+  void _onMessagesChanged(ChatSession session) {
+    final msgs = session.messages;
+    final lastId = msgs.isEmpty ? null : msgs.last.id;
+    final count = msgs.length;
+    if (lastId == _lastHandledMsgId && count == _lastMsgCount) return;
+
+    final prevCount = _lastMsgCount;
+    _lastHandledMsgId = lastId;
+    _lastMsgCount = count;
+
+    if (!_scrollBootstrapped) {
+      _scrollBootstrapped = true;
+      _jumpBottom(animated: false);
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _markSeenIfNearBottom();
+      });
+      return;
+    }
+    if (count <= prevCount || msgs.isEmpty) return;
+
+    final last = msgs.last;
+    if (last.fromMe || _isNearBottom()) {
+      if (_showNewMsgTip) {
+        setState(() => _showNewMsgTip = false);
+      }
+      _jumpBottom();
+      // After sticky-bottom layout, mark everything unread as read (reliable).
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          _markSeenIfNearBottom();
+        });
+      });
+    } else if (!last.fromMe) {
+      if (!_showNewMsgTip) setState(() => _showNewMsgTip = true);
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    final chat = context.read<ChatController>();
+    if (state == AppLifecycleState.resumed) {
+      chat.setAppForeground(true);
+      // Skip while gallery/file picker is up — heal races sendFile on Android.
+      if (!chat.isMediaPicking) {
+        unawaited(_healAfterForeground());
+      }
+      // Re-entering the app with this chat open → re-send reads.
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (!mounted) return;
+        _markSeenIfNearBottom();
+      });
+    } else if (state == AppLifecycleState.paused ||
+        state == AppLifecycleState.detached) {
+      chat.setAppForeground(false);
+    }
+  }
+
+  Future<void> _healAfterForeground() async {
+    if (!mounted) return;
+    final chat = context.read<ChatController>();
+    final auth = context.read<AuthController>();
+    final session = _session(chat);
+    if (session == null) return;
+    try {
+      await chat.healAfterForeground(
+        session,
+        ensureWebrpc: ({bool forceRelogin = false}) =>
+            auth.ensureWebrpcAlive(forceRelogin: forceRelogin),
+      );
+    } catch (e) {
+      if (mounted) {
+        showAppSnack(context, e);
+      }
+    }
   }
 
   ChatSession? _session(ChatController chat) {
@@ -52,53 +183,93 @@ class _ChatScreenState extends State<ChatScreen> {
       _jumpBottom();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+        showAppSnack(context, e);
       }
     }
   }
 
-  void _jumpBottom() {
+  void _jumpBottom({bool animated = true}) {
+    if (_showNewMsgTip) {
+      _showNewMsgTip = false;
+      // Avoid setState during build; tip cleared on next frame paint if needed.
+      if (mounted) {
+        WidgetsBinding.instance.addPostFrameCallback((_) {
+          if (mounted && !_showNewMsgTip) setState(() {});
+        });
+      }
+    }
+    void go() {
+      if (!mounted || !_scroll.hasClients) return;
+      final target = _scroll.position.maxScrollExtent;
+      if (animated) {
+        _scroll.animateTo(
+          target,
+          duration: const Duration(milliseconds: 220),
+          curve: Curves.easeOut,
+        );
+      } else {
+        _scroll.jumpTo(target);
+      }
+      _nearBottom = true;
+    }
+
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      if (!_scroll.hasClients) return;
-      _scroll.animateTo(
-        _scroll.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 220),
-        curve: Curves.easeOut,
-      );
+      go();
+      // Second frame: image/file bubbles may grow layout after first paint.
+      WidgetsBinding.instance.addPostFrameCallback((_) => go());
+    });
+  }
+
+  void _jumpBottomFromTip() {
+    setState(() => _showNewMsgTip = false);
+    _jumpBottom();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      _markSeenIfNearBottom();
     });
   }
 
   Future<void> _pickAlbum(ChatSession session, {required bool video}) async {
+    final chat = context.read<ChatController>();
+    chat.beginMediaPick();
     setState(() => _busy = true);
     try {
       final file = video
           ? await _picker.pickVideo(source: ImageSource.gallery)
           : await _picker.pickImage(source: ImageSource.gallery, imageQuality: 92);
       if (file == null || !mounted) return;
-      await context.read<ChatController>().sendFilePath(session, file.path);
+      // Gallery resume used to force-reconnect mid-pick; wait then soft-heal.
+      await _ensureConnected(session);
+      if (!session.connected || !mounted) return;
+      await chat.sendFilePath(session, file.path);
       _jumpBottom();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+        showAppSnack(context, e);
       }
     } finally {
+      chat.endMediaPick();
       if (mounted) setState(() => _busy = false);
     }
   }
 
   Future<void> _pickAnyFile(ChatSession session) async {
+    final chat = context.read<ChatController>();
+    chat.beginMediaPick();
     setState(() => _busy = true);
     try {
       final file = await FilePicker.pickFile();
       final path = file?.path;
       if (path == null || !mounted) return;
-      await context.read<ChatController>().sendFilePath(session, path);
+      await _ensureConnected(session);
+      if (!session.connected || !mounted) return;
+      await chat.sendFilePath(session, path);
       _jumpBottom();
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+        showAppSnack(context, e);
       }
     } finally {
+      chat.endMediaPick();
       if (mounted) setState(() => _busy = false);
     }
   }
@@ -118,22 +289,22 @@ class _ChatScreenState extends State<ChatScreen> {
           children: [
             ListTile(
               leading: const Icon(Icons.phone_outlined),
-              title: const Text('语音通话'),
+              title: Text('语音通话'.tr),
               onTap: () => Navigator.pop(ctx, 'voice'),
             ),
             ListTile(
               leading: const Icon(Icons.photo_outlined),
-              title: const Text('相册图片'),
+              title: Text('相册图片'.tr),
               onTap: () => Navigator.pop(ctx, 'image'),
             ),
             ListTile(
               leading: const Icon(Icons.videocam_outlined),
-              title: const Text('相册视频'),
+              title: Text('相册视频'.tr),
               onTap: () => Navigator.pop(ctx, 'video'),
             ),
             ListTile(
               leading: const Icon(Icons.folder_open_outlined),
-              title: const Text('选择文件'),
+              title: Text('选择文件'.tr),
               onTap: () => Navigator.pop(ctx, 'file'),
             ),
           ],
@@ -157,18 +328,36 @@ class _ChatScreenState extends State<ChatScreen> {
       await voice.invite(session);
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+        showAppSnack(context, e);
       }
     }
   }
 
   Future<void> _ensureConnected(ChatSession session) async {
-    if (session.connected) return;
+    if (session.connecting) return;
     try {
-      await context.read<ChatController>().connect(session);
+      final auth = context.read<AuthController>();
+      final chat = context.read<ChatController>();
+      await chat.healAfterForeground(
+        session,
+        ensureWebrpc: ({bool forceRelogin = false}) =>
+            auth.ensureWebrpcAlive(forceRelogin: forceRelogin),
+      );
+      if (!session.connected && mounted) {
+        showAppSnack(
+          context,
+          session.connectError.isNotEmpty
+              ? session.connectError
+              : '连接失败，请重试'.tr,
+        );
+      }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+        showAppSnack(
+          context,
+          session.connectError.isNotEmpty ? session.connectError : e,
+          fallback: '连接失败，请重试'.tr,
+        );
       }
     }
   }
@@ -181,7 +370,7 @@ class _ChatScreenState extends State<ChatScreen> {
       }
     } catch (e) {
       if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('$e')));
+        showAppSnack(context, e);
       }
     }
   }
@@ -209,10 +398,15 @@ class _ChatScreenState extends State<ChatScreen> {
     final session = _session(chat);
     if (session == null) {
       return Scaffold(
-        appBar: AppBar(title: const Text('会话')),
-        body: const Center(child: Text('会话不存在')),
+        appBar: AppBar(title: Text('会话'.tr)),
+        body: Center(child: Text('会话不存在'.tr)),
       );
     }
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      _onMessagesChanged(session);
+    });
 
     return Scaffold(
       backgroundColor: AppTheme.mist,
@@ -223,10 +417,10 @@ class _ChatScreenState extends State<ChatScreen> {
             Text(session.displayTitle, style: const TextStyle(fontSize: 17)),
             Text(
               session.connected
-                  ? '已连接'
+                  ? '已连接'.tr
                   : session.connecting
-                      ? '连接中…'
-                      : '未连接',
+                      ? '连接中…'.tr
+                      : '未连接'.tr,
               style: TextStyle(
                 fontSize: 12,
                 color: session.connected ? AppTheme.accent : AppTheme.ink.withValues(alpha: 0.5),
@@ -237,13 +431,15 @@ class _ChatScreenState extends State<ChatScreen> {
         actions: [
           if (!session.connected)
             TextButton(
-              onPressed: _busy ? null : () => _ensureConnected(session),
-              child: const Text('连接'),
+              onPressed: (session.connecting || _busy)
+                  ? null
+                  : () => unawaited(_ensureConnected(session)),
+              child: Text(session.connecting ? '连接中…'.tr : '连接'.tr),
             )
           else
             TextButton(
               onPressed: () => chat.disconnect(session),
-              child: const Text('断开'),
+              child: Text('断开'.tr),
             ),
           PopupMenuButton<String>(
             onSelected: (v) async {
@@ -253,8 +449,8 @@ class _ChatScreenState extends State<ChatScreen> {
                 await chat.clearChat(session);
               }
             },
-            itemBuilder: (_) => const [
-              PopupMenuItem(value: 'clear', child: Text('清空内容')),
+            itemBuilder: (_) => [
+              PopupMenuItem(value: 'clear', child: Text('清空内容'.tr)),
             ],
           ),
         ],
@@ -281,59 +477,121 @@ class _ChatScreenState extends State<ChatScreen> {
               ),
             ),
           Expanded(
-            child: ListView.builder(
-              controller: _scroll,
-              padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
-              itemCount: session.messages.length,
-              itemBuilder: (context, index) {
-                final msg = session.messages[index];
-                final ready = msg.filePath.isNotEmpty &&
-                    (msg.status == ChatMsgStatus.received ||
-                        msg.status == ChatMsgStatus.sent ||
-                        msg.fromMe);
-                return _Bubble(
-                  message: msg,
-                  onRetry: msg.fromMe && msg.status == ChatMsgStatus.failed
-                      ? () async {
-                          try {
-                            await chat.retryMessage(session, msg);
-                          } catch (e) {
-                            if (context.mounted) {
-                              ScaffoldMessenger.of(context).showSnackBar(
-                                SnackBar(content: Text('$e')),
-                              );
+            child: Stack(
+              children: [
+                ListView.builder(
+                  controller: _scroll,
+                  padding: const EdgeInsets.fromLTRB(12, 12, 12, 12),
+                  itemCount: session.messages.length,
+                  itemBuilder: (context, index) {
+                    final msg = session.messages[index];
+                    final ready = msg.filePath.isNotEmpty &&
+                        (msg.status == ChatMsgStatus.received ||
+                            msg.status == ChatMsgStatus.sent ||
+                            msg.fromMe);
+                    final bubble = _Bubble(
+                      message: msg,
+                      peerCapsRead: session.peerCapsRead,
+                      onEngage: msg.fromMe
+                          ? null
+                          : () => chat.confirmPeerMessagesRead(
+                                session,
+                                [msg.id],
+                              ),
+                      onRetry: msg.fromMe && msg.status == ChatMsgStatus.failed
+                          ? () async {
+                              try {
+                                await chat.retryMessage(session, msg);
+                              } catch (e) {
+                                if (context.mounted) showAppSnack(context, e);
+                              }
                             }
-                          }
-                        }
-                      : null,
-                  onPreview: ready &&
-                          (msg.kind == ChatMsgKind.image ||
-                              msg.kind == ChatMsgKind.video)
-                      ? () => _previewMedia(msg)
-                      : null,
-                  onOpen: ready ? () => OpenFilex.open(msg.filePath) : null,
-                  onSaveAlbum: ready &&
-                          (msg.kind == ChatMsgKind.image ||
-                              msg.kind == ChatMsgKind.video)
-                      ? () => _runSave(() => _saver.saveToAlbum(msg))
-                      : null,
-                  onSaveDownload: ready
-                      ? () => _runSave(() => _saver.saveToDownloads(msg))
-                      : null,
-                  onCopy: msg.kind == ChatMsgKind.text
-                      ? () async {
-                          await Clipboard.setData(
-                            ClipboardData(text: msg.content),
-                          );
-                          if (context.mounted) {
-                            ScaffoldMessenger.of(context).showSnackBar(
-                              const SnackBar(content: Text('已复制')),
-                            );
-                          }
-                        }
-                      : null,
-                );
-              },
+                          : null,
+                      onPreview: ready &&
+                              (msg.kind == ChatMsgKind.image ||
+                                  msg.kind == ChatMsgKind.video)
+                          ? () => _previewMedia(msg)
+                          : null,
+                      onOpen:
+                          ready ? () => OpenFilex.open(msg.filePath) : null,
+                      onSaveAlbum: ready &&
+                              (msg.kind == ChatMsgKind.image ||
+                                  msg.kind == ChatMsgKind.video)
+                          ? () => _runSave(() => _saver.saveToAlbum(msg))
+                          : null,
+                      onSaveDownload: ready
+                          ? () =>
+                              _runSave(() => _saver.saveToDownloads(msg))
+                          : null,
+                      onCopy: msg.kind == ChatMsgKind.text
+                          ? () async {
+                              await Clipboard.setData(
+                                ClipboardData(text: msg.content),
+                              );
+                              if (context.mounted) {
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  SnackBar(content: Text('已复制'.tr)),
+                                );
+                              }
+                            }
+                          : null,
+                    );
+                    if (msg.fromMe) return bubble;
+                    // Re-send type-25 whenever this peer bubble is on screen again.
+                    return MessageVisibility(
+                      key: ValueKey('vis-${msg.id}'),
+                      enabled: true,
+                      repeatWhenVisible: true,
+                      onVisible: () =>
+                          chat.confirmPeerMessagesRead(session, [msg.id]),
+                      child: bubble,
+                    );
+                  },
+                ),
+                if (_showNewMsgTip)
+                  Positioned(
+                    left: 0,
+                    right: 0,
+                    bottom: 10,
+                    child: Center(
+                      child: Material(
+                        color: Colors.white,
+                        elevation: 3,
+                        shadowColor: Colors.black26,
+                        borderRadius: BorderRadius.circular(20),
+                        child: InkWell(
+                          onTap: _jumpBottomFromTip,
+                          borderRadius: BorderRadius.circular(20),
+                          child: Padding(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 8,
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(
+                                  Icons.keyboard_arrow_down_rounded,
+                                  size: 18,
+                                  color: AppTheme.accent,
+                                ),
+                                const SizedBox(width: 4),
+                                Text(
+                                  '有新消息'.tr,
+                                  style: TextStyle(
+                                    color: AppTheme.accent,
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ),
+              ],
             ),
           ),
           _Composer(
@@ -377,7 +635,7 @@ class _Composer extends StatelessWidget {
             IconButton(
               onPressed: enabled ? onAttach : null,
               icon: const Icon(Icons.add_circle_outline),
-              tooltip: '发送文件',
+              tooltip: '发送文件'.tr,
             ),
             Expanded(
               child: TextField(
@@ -390,7 +648,7 @@ class _Composer extends StatelessWidget {
                 textInputAction: TextInputAction.send,
                 onSubmitted: (_) => onSend(),
                 decoration: InputDecoration(
-                  hintText: connected ? '输入消息' : '未连接，先点右上角连接',
+                  hintText: connected ? '输入消息'.tr : '未连接，先点右上角连接'.tr,
                   filled: true,
                   fillColor: AppTheme.mist,
                   border: OutlineInputBorder(
@@ -417,6 +675,8 @@ class _Composer extends StatelessWidget {
 class _Bubble extends StatelessWidget {
   const _Bubble({
     required this.message,
+    required this.peerCapsRead,
+    this.onEngage,
     this.onRetry,
     this.onPreview,
     this.onOpen,
@@ -426,6 +686,9 @@ class _Bubble extends StatelessWidget {
   });
 
   final ChatMessage message;
+  final bool peerCapsRead;
+  /// Peer bubble tap / open — re-send type-25 read receipt.
+  final VoidCallback? onEngage;
   final VoidCallback? onRetry;
   final VoidCallback? onPreview;
   final VoidCallback? onOpen;
@@ -470,13 +733,17 @@ class _Bubble extends StatelessWidget {
                 ),
                 child: InkWell(
                   onTap: () {
+                    onEngage?.call();
                     if (onPreview != null) {
                       onPreview!();
                     } else if (!isFile && onCopy != null) {
                       // no-op tap for text
                     }
                   },
-                  onLongPress: () => _showActions(context),
+                  onLongPress: () {
+                    onEngage?.call();
+                    _showActions(context);
+                  },
                   borderRadius: BorderRadius.circular(16),
                   child: Padding(
                     padding: EdgeInsets.symmetric(
@@ -489,7 +756,9 @@ class _Bubble extends StatelessWidget {
               ),
               const SizedBox(height: 2),
               Text(
-                isFile ? '$time · ${_statusLabel(message)}' : time,
+                mine
+                    ? '$time · ${_statusLabel(message)}'
+                    : (isFile ? '$time · ${_statusLabel(message)}' : time),
                 style: TextStyle(
                   fontSize: 11,
                   color: AppTheme.ink.withValues(alpha: 0.4),
@@ -498,7 +767,7 @@ class _Bubble extends StatelessWidget {
               if (onRetry != null)
                 TextButton(
                   onPressed: onRetry,
-                  child: const Text('重发'),
+                  child: Text('重发'.tr),
                 ),
             ],
           ),
@@ -522,7 +791,7 @@ class _Bubble extends StatelessWidget {
             if (!isFile && onCopy != null)
               ListTile(
                 leading: const Icon(Icons.copy),
-                title: const Text('复制'),
+                title: Text('复制'.tr),
                 onTap: () {
                   Navigator.pop(ctx);
                   onCopy!();
@@ -531,7 +800,7 @@ class _Bubble extends StatelessWidget {
             if (isMedia && onSaveAlbum != null)
               ListTile(
                 leading: const Icon(Icons.photo_album_outlined),
-                title: const Text('保存到相册'),
+                title: Text('保存到相册'.tr),
                 onTap: () {
                   Navigator.pop(ctx);
                   onSaveAlbum!();
@@ -540,7 +809,7 @@ class _Bubble extends StatelessWidget {
             if (isMedia && onOpen != null)
               ListTile(
                 leading: const Icon(Icons.open_in_new),
-                title: const Text('打开'),
+                title: Text('打开'.tr),
                 onTap: () {
                   Navigator.pop(ctx);
                   onOpen!();
@@ -549,7 +818,7 @@ class _Bubble extends StatelessWidget {
             if (isFile && onSaveDownload != null)
               ListTile(
                 leading: const Icon(Icons.download_outlined),
-                title: const Text('保存到下载'),
+                title: Text('保存到下载'.tr),
                 onTap: () {
                   Navigator.pop(ctx);
                   onSaveDownload!();
@@ -558,7 +827,7 @@ class _Bubble extends StatelessWidget {
             if (onRetry != null)
               ListTile(
                 leading: const Icon(Icons.refresh),
-                title: const Text('重发'),
+                title: Text('重发'.tr),
                 onTap: () {
                   Navigator.pop(ctx);
                   onRetry!();
@@ -566,7 +835,7 @@ class _Bubble extends StatelessWidget {
               ),
             ListTile(
               leading: const Icon(Icons.close),
-              title: const Text('取消'),
+              title: Text('取消'.tr),
               onTap: () => Navigator.pop(ctx),
             ),
           ],
@@ -578,17 +847,20 @@ class _Bubble extends StatelessWidget {
   String _statusLabel(ChatMessage m) {
     if (m.fromMe) {
       return switch (m.status) {
-        ChatMsgStatus.sending => '发送中',
-        ChatMsgStatus.sent => '发送成功',
-        ChatMsgStatus.failed => '发送失败',
-        _ => '发送成功',
+        ChatMsgStatus.sending => '发送中'.tr,
+        ChatMsgStatus.failed => '发送失败'.tr,
+        // Once persisted as read, always show 已读 (reconnect must not flip UI).
+        ChatMsgStatus.read => '已读'.tr,
+        // Delivered — unread until peer read receipt; no read cap ⇒ forever unread.
+        ChatMsgStatus.sent => '未读'.tr,
+        _ => '未读'.tr,
       };
     }
     return switch (m.status) {
-      ChatMsgStatus.receiving => '接收中',
-      ChatMsgStatus.received => '接收成功',
-      ChatMsgStatus.failed => '接收失败',
-      _ => '接收成功',
+      ChatMsgStatus.receiving => '接收中'.tr,
+      ChatMsgStatus.received => '接收成功'.tr,
+      ChatMsgStatus.failed => '接收失败'.tr,
+      _ => '接收成功'.tr,
     };
   }
 }
@@ -616,12 +888,22 @@ class _FileCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final muted = foreground.withValues(alpha: 0.78);
     final title = truncateUtf8Bytes(message.title, 30);
-    final busy = message.status == ChatMsgStatus.sending ||
+    final transferring = message.status == ChatMsgStatus.sending ||
         message.status == ChatMsgStatus.receiving;
-    final moved = message.fromMe ? '已发送' : '已接收';
+    final bytesDone =
+        message.size > 0 && message.transferred >= message.size;
+    // Option A: progress only; 发送中/未读/已读 are under the bubble (meta).
+    final showBar = transferring && !bytesDone;
+    final elapsed = AppL10n.current.fill(
+      r'耗时 ${formatDurationMs(message.elapsedMs)} · 平均 ${formatSpeedBps(message.speedBps)}',
+      {
+        r'${formatDurationMs(message.elapsedMs)}':
+            formatDurationMs(message.elapsedMs),
+        r'${formatSpeedBps(message.speedBps)}': formatSpeedBps(message.speedBps),
+      },
+    );
     final xfer =
-        '$moved ${formatBytes(message.transferred)} / ${formatBytes(message.size)}\n'
-        '耗时 ${formatDurationMs(message.elapsedMs)} · 平均 ${formatSpeedBps(message.speedBps)}';
+        '${formatBytes(message.transferred)} / ${formatBytes(message.size)}\n$elapsed';
 
     if (_showImageThumb) {
       return Column(
@@ -662,7 +944,7 @@ class _FileCard extends StatelessWidget {
           ),
           const SizedBox(height: 6),
           Text(xfer, style: TextStyle(color: muted, fontSize: 11.5, height: 1.45)),
-          if (busy) ...[
+          if (showBar) ...[
             const SizedBox(height: 8),
             ClipRRect(
               borderRadius: BorderRadius.circular(4),
@@ -707,7 +989,7 @@ class _FileCard extends StatelessWidget {
                 xfer,
                 style: TextStyle(color: muted, fontSize: 11.5, height: 1.45),
               ),
-              if (busy) ...[
+              if (showBar) ...[
                 const SizedBox(height: 8),
                 ClipRRect(
                   borderRadius: BorderRadius.circular(4),

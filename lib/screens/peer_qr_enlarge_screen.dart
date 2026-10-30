@@ -1,3 +1,4 @@
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:qr_flutter/qr_flutter.dart';
@@ -28,18 +29,18 @@ class PeerQrEnlargeScreen extends StatelessWidget {
         backgroundColor: Colors.transparent,
         foregroundColor: Colors.white,
         elevation: 0,
-        title: const Text('我的二维码'),
+        title: Text('我的二维码'.tr),
         actions: [
           IconButton(
-            tooltip: '复制连接信息',
+            tooltip: '复制连接信息'.tr,
             onPressed: () async {
-              final passLine = permission.isEmpty ? '（未设置）' : permission;
+              final passLine = permission.isEmpty ? '（未设置）'.tr : permission;
               await Clipboard.setData(
-                ClipboardData(text: 'Token：$token\n认证口令：$passLine'),
+                ClipboardData(text: AppL10n.current.fill(r'Token：$token\n认证口令：$passLine', {r'$token': token, r'$passLine': passLine})),
               );
               if (!context.mounted) return;
               ScaffoldMessenger.of(context).showSnackBar(
-                const SnackBar(content: Text('已复制 Token 和口令')),
+                SnackBar(content: Text('已复制 Token 和口令'.tr)),
               );
             },
             icon: const Icon(Icons.copy_all_outlined),
@@ -84,7 +85,7 @@ class PeerQrEnlargeScreen extends StatelessWidget {
                       ),
                       const SizedBox(height: 14),
                       Text(
-                        '扫一扫，加我为会话',
+                        '扫一扫，加我为会话'.tr,
                         style: TextStyle(
                           fontSize: 15,
                           fontWeight: FontWeight.w700,
@@ -93,7 +94,7 @@ class PeerQrEnlargeScreen extends StatelessWidget {
                       ),
                       const SizedBox(height: 6),
                       Text(
-                        '对方在「新建会话」中扫码即可填入 Token 与口令',
+                        '对方在「新建会话」中扫码即可填入 Token 与口令'.tr,
                         textAlign: TextAlign.center,
                         style: TextStyle(
                           fontSize: 12.5,

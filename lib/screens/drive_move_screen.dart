@@ -1,3 +1,4 @@
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -98,18 +99,18 @@ class _DriveMoveScreenState extends State<DriveMoveScreen> {
     final session = drive.sessionById(widget.sessionId);
     if (session == null) {
       return Scaffold(
-        appBar: AppBar(title: const Text('移动到')),
-        body: const Center(child: Text('会话不存在')),
+        appBar: AppBar(title: Text('移动到'.tr)),
+        body: Center(child: Text('会话不存在'.tr)),
       );
     }
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('移动到'),
+        title: Text('移动到'.tr),
         actions: [
           TextButton(
             onPressed: _busy ? null : () => _confirm(session),
-            child: const Text('移到此处'),
+            child: Text('移到此处'.tr),
           ),
         ],
       ),
@@ -148,7 +149,7 @@ class _DriveMoveScreenState extends State<DriveMoveScreen> {
           Padding(
             padding: const EdgeInsets.all(12),
             child: Text(
-              '将 ${widget.names.length} 项从 $_fromPath 移动到上方目录',
+              AppL10n.current.fill(r'将 ${widget.names.length} 项从 $_fromPath 移动到上方目录', {r'${widget.names.length}': '${widget.names.length}', r'$_fromPath': _fromPath}),
               style: TextStyle(color: AppTheme.ink.withValues(alpha: 0.55)),
             ),
           ),

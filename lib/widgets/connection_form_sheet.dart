@@ -1,3 +1,4 @@
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -92,7 +93,7 @@ class ConnectionFormSheet extends StatelessWidget {
                     ),
                   ),
                   IconButton(
-                    tooltip: '关闭',
+                    tooltip: '关闭'.tr,
                     onPressed: () => Navigator.pop(context),
                     visualDensity: VisualDensity.compact,
                     icon: Icon(
@@ -125,7 +126,7 @@ class ConnectionFormSheet extends StatelessWidget {
               TextButton(
                 onPressed: () => Navigator.pop(context),
                 child: Text(
-                  '取消',
+                  '取消'.tr,
                   style: TextStyle(
                     color: AppTheme.ink.withValues(alpha: 0.55),
                     fontWeight: FontWeight.w600,
@@ -188,7 +189,7 @@ class FormFieldBlock extends StatelessWidget {
               if (optional) ...[
                 const SizedBox(width: 6),
                 Text(
-                  '可选',
+                  '可选'.tr,
                   style: TextStyle(
                     fontSize: 11.5,
                     color: AppTheme.ink.withValues(alpha: 0.38),
@@ -264,13 +265,14 @@ class FormFieldBlock extends StatelessWidget {
 }
 
 class ConnectNowToggle extends StatelessWidget {
-  const ConnectNowToggle({
+  ConnectNowToggle({
     super.key,
     required this.value,
     required this.onChanged,
-    this.title = '创建后立即连接',
-    this.subtitle = '保存后自动建立连接',
-  });
+    String? title,
+    String? subtitle,
+  })  : title = title ?? '创建后立即连接'.tr,
+        subtitle = subtitle ?? '保存后自动建立连接'.tr;
 
   final bool value;
   final ValueChanged<bool> onChanged;

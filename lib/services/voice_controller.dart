@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/foundation.dart';
 import 'package:permission_handler/permission_handler.dart';
 
@@ -123,21 +124,21 @@ class VoiceController extends ChangeNotifier {
 
   Future<void> invite(ChatSession session) async {
     if (!_webrpc.isOnline) {
-      throw StateError('请先登录');
+      throw StateError('请先登录'.tr);
     }
     if (!session.connected || session.rpcSessionId == 0) {
-      throw StateError('请先连接会话再发起语音通话');
+      throw StateError('请先连接会话再发起语音通话'.tr);
     }
     if (isBusy) {
-      throw StateError('当前已有语音通话，请先结束');
+      throw StateError('当前已有语音通话，请先结束'.tr);
     }
     final pass = session.peerPass.trim();
     if (pass.isEmpty) {
-      throw StateError('缺少对方口令，请重新连接聊天会话后再试');
+      throw StateError('缺少对方口令，请重新连接聊天会话后再试'.tr);
     }
     final mic = await Permission.microphone.request();
     if (!mic.isGranted) {
-      throw StateError('需要麦克风权限才能发起语音通话');
+      throw StateError('需要麦克风权限才能发起语音通话'.tr);
     }
 
     final callId = '${session.rpcSessionId}-${DateTime.now().millisecondsSinceEpoch}';
@@ -159,11 +160,11 @@ class VoiceController extends ChangeNotifier {
 
   Future<void> accept() async {
     if (_state.phase != VoicePhase.incoming) {
-      throw StateError('当前没有待接听的通话');
+      throw StateError('当前没有待接听的通话'.tr);
     }
     final mic = await Permission.microphone.request();
     if (!mic.isGranted) {
-      throw StateError('需要麦克风权限才能接听');
+      throw StateError('需要麦克风权限才能接听'.tr);
     }
     final chatRpc = _state.chatRpcId;
     final callId = _state.callId;
@@ -299,7 +300,7 @@ class VoiceController extends ChangeNotifier {
         : (session?.peerPass.trim() ?? '');
     final peer = session?.peerToken ?? _state.peerToken;
     if (peer.isEmpty || pass.isEmpty) {
-      await _failAndHangup(chatRpc, callId, '语音会话创建失败：缺少对端信息');
+      await _failAndHangup(chatRpc, callId, '语音会话创建失败：缺少对端信息'.tr);
       return;
     }
     int voiceId = 0;
@@ -319,7 +320,7 @@ class VoiceController extends ChangeNotifier {
       }, timeoutMs: 10000);
       if (!helloOk) {
         _webrpc.closeSession(voiceId);
-        throw StateError('语音握手失败');
+        throw StateError('语音握手失败'.tr);
       }
       _knownMediaSessions.add(voiceId);
       if (_state.phase != VoicePhase.active ||
@@ -338,7 +339,7 @@ class VoiceController extends ChangeNotifier {
           _webrpc.closeSession(voiceId);
         } catch (_) {}
       }
-      await _failAndHangup(chatRpc, callId, '语音会话创建失败');
+      await _failAndHangup(chatRpc, callId, '语音会话创建失败'.tr);
     }
   }
 
@@ -364,7 +365,7 @@ class VoiceController extends ChangeNotifier {
       _sendVoiceSessionSignal(chatRpcId, 'stop', callId, voiceSessionId);
       _sendSignal(chatRpcId, 'hangup', callId);
       await _clearIdle(closeVoiceTransport: false);
-      _setState(_state.copyWith(error: '语音媒体启动失败'));
+      _setState(_state.copyWith(error: '语音媒体启动失败'.tr));
     }
   }
 

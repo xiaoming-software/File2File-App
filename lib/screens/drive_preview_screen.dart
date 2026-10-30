@@ -2,12 +2,12 @@ import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:media_kit/media_kit.dart';
 import 'package:media_kit_video/media_kit_video.dart';
 import 'package:provider/provider.dart';
-import 'package:video_player/video_player.dart' as vp;
 
 import '../models/drive_models.dart';
 import '../services/drive_controller.dart';
@@ -45,10 +45,11 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
   Player? _mkPlayer;
   VideoController? _mkVideo;
   StreamSubscription<String>? _mkErrorSub;
-  vp.VideoPlayerController? _vpPlayer;
   bool _playerReady = false;
   bool _openingPlayer = false;
-  bool _usingVideoPlayer = false;
+  /// HTTP stream failed once → fall back to SendFile local (do not loop).
+  bool _httpFallbackTried = false;
+  bool _playingHttp = false;
   Timer? _poll;
   final _saver = MediaSaveService();
 
@@ -56,16 +57,6 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
 
   bool get _isMedia =>
       _kind == DrivePreviewKind.audio || _kind == DrivePreviewKind.video;
-
-  String get _ext {
-    final n = widget.entry.name.toLowerCase();
-    final i = n.lastIndexOf('.');
-    return i < 0 ? '' : n.substring(i);
-  }
-
-  /// System player is usually best for common MP4; media_kit covers MOV/MP3/etc.
-  bool get _preferSystemPlayer =>
-      _ext == '.mp4' || _ext == '.m4v' || _ext == '.m4a';
 
   @override
   void initState() {
@@ -107,15 +98,7 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
         await mk.dispose();
       } catch (_) {}
     }
-    final vpCtrl = _vpPlayer;
-    _vpPlayer = null;
-    if (vpCtrl != null) {
-      try {
-        await vpCtrl.dispose();
-      } catch (_) {}
-    }
     _playerReady = false;
-    _usingVideoPlayer = false;
   }
 
   Future<void> _start() async {
@@ -125,10 +108,44 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
     if (session == null) {
       setState(() {
         _loading = false;
-        _error = '会话不存在';
+        _error = '会话不存在'.tr;
       });
       return;
     }
+    // Video/audio: mpv (media_kit) over HTTP proxy first; on failure → SendFile local.
+    if (_isMedia && !_httpFallbackTried) {
+      final url = drive.mediaStreamUrl(
+        session,
+        widget.remoteDir,
+        widget.entry.name,
+      );
+      if (url != null && url.isNotEmpty) {
+        try {
+          await _openWithMediaKitNetwork(url);
+          if (!mounted) return;
+          setState(() {
+            _playerReady = true;
+            _localPath = url;
+            _playingHttp = true;
+            _loading = false;
+            _error = null;
+          });
+          return;
+        } catch (e) {
+          await _disposePlayer();
+          debugPrint('drive preview http/mpv failed: $e');
+          _httpFallbackTried = true;
+          _playingHttp = false;
+        }
+      }
+    }
+    await _startSendFilePreview(drive, session);
+  }
+
+  Future<void> _startSendFilePreview(
+    DriveController drive,
+    DriveSession session,
+  ) async {
     try {
       final t = await drive.startDownload(
         session,
@@ -141,6 +158,7 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
         return;
       }
       _transfer = t;
+      _poll?.cancel();
       _poll = Timer.periodic(const Duration(milliseconds: 400), (_) {
         if (!mounted) return;
         final cur = drive.transferById(session, t.id) ?? t;
@@ -149,7 +167,7 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
             cur.status == DriveTransferStatus.cancelled) {
           setState(() {
             _loading = false;
-            _error = cur.error.isEmpty ? '下载失败' : cur.error;
+            _error = cur.error.isEmpty ? '下载失败'.tr : cur.error;
           });
           _poll?.cancel();
           return;
@@ -167,6 +185,53 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
     }
   }
 
+  Future<void> _fallbackHttpToSendFile() async {
+    if (_httpFallbackTried) return;
+    _httpFallbackTried = true;
+    _playingHttp = false;
+    await _disposePlayer();
+    if (!mounted) return;
+    setState(() {
+      _loading = true;
+      _playerReady = false;
+      _error = null;
+      _localPath = null;
+    });
+    final drive = _drive ?? context.read<DriveController>();
+    final session = drive.sessionById(widget.sessionId);
+    if (session == null) return;
+    await _startSendFilePreview(drive, session);
+  }
+
+  Future<void> _openWithMediaKitNetwork(String url) async {
+    _openingPlayer = true;
+    try {
+      await _disposePlayer();
+      final player = Player();
+      final video = VideoController(player);
+      _mkPlayer = player;
+      _mkVideo = video;
+      _playingHttp = true;
+      _mkErrorSub = player.stream.error.listen((msg) {
+        if (!mounted || msg.trim().isEmpty) return;
+        // Mid-stream decode/format failure → SendFile local via mpv.
+        if (_playingHttp && !_httpFallbackTried) {
+          unawaited(_fallbackHttpToSendFile());
+          return;
+        }
+        setState(() {
+          _loading = false;
+          _playerReady = false;
+          _error = AppL10n.current.fill(r'无法播放：$msg', {r'$msg': msg});
+        });
+      });
+      await player.open(Media(url), play: true).timeout(_playerOpenTimeout);
+      await player.setPlaylistMode(PlaylistMode.loop);
+    } finally {
+      _openingPlayer = false;
+    }
+  }
+
   Future<void> _retryOpen() async {
     setState(() {
       _error = null;
@@ -174,56 +239,13 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
       _playerReady = false;
       _localPath = null;
       _openingPlayer = false;
+      _httpFallbackTried = false;
+      _playingHttp = false;
     });
     await _disposePlayer();
-    final drive = _drive;
-    if (drive == null) return;
-    final session = drive.sessionById(widget.sessionId);
-    final old = _transfer;
-    if (session != null && old != null) {
-      // Drop empty/broken cache so the next startDownload actually fetches again.
-      if (old.localPath.isNotEmpty) {
-        try {
-          final f = File(old.localPath);
-          if (await f.exists() && await f.length() <= 0) {
-            await f.delete();
-          }
-        } catch (_) {}
-      }
-      if (old.status == DriveTransferStatus.done && old.transferred <= 0) {
-        old.status = DriveTransferStatus.failed;
-        old.error = '内容为空，准备重新下载';
-      }
-      try {
-        final t = await drive.startDownload(
-          session,
-          widget.entry,
-          remoteDir: widget.remoteDir,
-          forPreview: true,
-        );
-        if (!mounted) return;
-        _transfer = t;
-        _poll?.cancel();
-        _poll = Timer.periodic(const Duration(milliseconds: 400), (_) {
-          if (!mounted) return;
-          final cur = drive.transferById(session, t.id) ?? t;
-          setState(() => _transfer = cur);
-          unawaited(_maybeOpen(cur));
-        });
-        await _maybeOpen(t);
-        return;
-      } catch (e) {
-        if (mounted) {
-          setState(() {
-            _loading = false;
-            _error = '$e';
-          });
-        }
-        return;
-      }
-    }
-    final t = _transfer;
-    if (t != null) await _maybeOpen(t);
+    _poll?.cancel();
+    _transfer = null;
+    await _start();
   }
 
   Future<void> _maybeOpen(DriveTransfer t) async {
@@ -238,7 +260,7 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
       if (bytes.contains(0)) {
         setState(() {
           _loading = false;
-          _error = '不是文本文件';
+          _error = '不是文本文件'.tr;
         });
         return;
       }
@@ -278,7 +300,7 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
       if (mounted) {
         setState(() {
           _loading = false;
-          _error = '下载内容为空（可能未真正拉取文件），请点重试';
+          _error = '下载内容为空（可能未真正拉取文件），请点重试'.tr;
         });
         _poll?.cancel();
       }
@@ -287,35 +309,10 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
 
     _openingPlayer = true;
     if (mounted) setState(() => _loading = true);
-    Object? lastError;
     try {
       await _disposePlayer();
-      final preferSystem = _preferSystemPlayer && _kind == DrivePreviewKind.video;
-      final order = preferSystem
-          ? const ['system', 'mediakit']
-          : const ['mediakit', 'system'];
-      var opened = false;
-      for (final engine in order) {
-        if (_kind == DrivePreviewKind.audio && engine == 'system') {
-          // video_player is weak for many audio-only files; skip for audio.
-          continue;
-        }
-        try {
-          if (engine == 'system') {
-            await _openWithVideoPlayer(t.localPath);
-          } else {
-            await _openWithMediaKit(t.localPath);
-          }
-          opened = true;
-          break;
-        } catch (e) {
-          lastError = e;
-          await _disposePlayer();
-        }
-      }
-      if (!opened) {
-        throw lastError ?? StateError('无法打开媒体');
-      }
+      // Local SendFile path: mpv (media_kit) only — best format coverage.
+      await _openWithMediaKit(t.localPath);
       if (!mounted) {
         await _disposePlayer();
         return;
@@ -323,6 +320,7 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
       setState(() {
         _playerReady = true;
         _localPath = t.localPath;
+        _playingHttp = false;
         _loading = false;
         _error = null;
       });
@@ -333,7 +331,7 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
         setState(() {
           _loading = false;
           _playerReady = false;
-          _error = '无法播放：$e';
+          _error = AppL10n.current.fill(r'无法播放：$e', {r'$e': '$e'});
         });
         _poll?.cancel();
       }
@@ -347,13 +345,12 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
     final video = VideoController(player);
     _mkPlayer = player;
     _mkVideo = video;
-    _usingVideoPlayer = false;
     _mkErrorSub = player.stream.error.listen((msg) {
       if (!mounted || msg.trim().isEmpty) return;
       setState(() {
         _loading = false;
         _playerReady = false;
-        _error = '无法播放：$msg';
+        _error = AppL10n.current.fill(r'无法播放：$msg', {r'$msg': msg});
       });
       _poll?.cancel();
     });
@@ -372,15 +369,6 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
     await player.setPlaylistMode(PlaylistMode.loop);
   }
 
-  Future<void> _openWithVideoPlayer(String path) async {
-    final c = vp.VideoPlayerController.file(File(path));
-    _vpPlayer = c;
-    _usingVideoPlayer = true;
-    await c.initialize().timeout(_playerOpenTimeout);
-    await c.setLooping(true);
-    await c.play();
-  }
-
   Future<void> _saveText() async {
     final drive = context.read<DriveController>();
     final session = drive.sessionById(widget.sessionId);
@@ -396,7 +384,7 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
       setState(() => _textDirty = false);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('已保存到网盘')),
+          SnackBar(content: Text('已保存到网盘'.tr)),
         );
       }
     } catch (e) {
@@ -439,14 +427,14 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
         actions: [
           if (_kind == DrivePreviewKind.text) ...[
             IconButton(
-              tooltip: '复制全部',
+              tooltip: '复制全部'.tr,
               onPressed: _loading
                   ? null
                   : () async {
                       await Clipboard.setData(ClipboardData(text: _textCtrl.text));
                       if (context.mounted) {
                         ScaffoldMessenger.of(context).showSnackBar(
-                          const SnackBar(content: Text('已复制')),
+                          SnackBar(content: Text('已复制'.tr)),
                         );
                       }
                     },
@@ -460,14 +448,14 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
                       height: 18,
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
-                  : const Text('保存'),
+                  : Text('保存'.tr),
             ),
           ],
           if ((_kind == DrivePreviewKind.image || _kind == DrivePreviewKind.video) &&
               _localPath != null &&
               t?.status == DriveTransferStatus.done)
             IconButton(
-              tooltip: '保存到相册',
+              tooltip: '保存到相册'.tr,
               onPressed: _saveAlbum,
               icon: const Icon(Icons.photo_album_outlined),
             ),
@@ -494,7 +482,7 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
                 const SizedBox(height: 16),
                 FilledButton(
                   onPressed: _retryOpen,
-                  child: const Text('重试打开'),
+                  child: Text('重试打开'.tr),
                 ),
               ],
             ],
@@ -518,12 +506,12 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
             const SizedBox(height: 16),
             Text(
               opening
-                  ? '正在打开…'
+                  ? '正在打开…'.tr
                   : downloading
                       ? (t.status == DriveTransferStatus.queued
-                          ? '排队下载中…'
-                          : '正在下载…')
-                      : '准备中…',
+                          ? '排队下载中…'.tr
+                          : '正在下载…'.tr)
+                      : '准备中…'.tr,
               style: TextStyle(
                 color: lightText
                     ? Colors.white70
@@ -560,9 +548,9 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
             onChanged: (_) {
               if (!_textDirty) setState(() => _textDirty = true);
             },
-            decoration: const InputDecoration(
+            decoration: InputDecoration(
               border: OutlineInputBorder(),
-              hintText: '文本内容',
+              hintText: '文本内容'.tr,
             ),
           ),
         );
@@ -580,37 +568,6 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
           );
         }
         final isAudio = _kind == DrivePreviewKind.audio;
-        if (_usingVideoPlayer) {
-          final c = _vpPlayer;
-          if (c == null) {
-            return const Center(
-              child: CircularProgressIndicator(color: Colors.white),
-            );
-          }
-          return Column(
-            children: [
-              Expanded(
-                child: isAudio
-                    ? const Center(
-                        child: Icon(
-                          Icons.audiotrack,
-                          size: 96,
-                          color: Colors.white70,
-                        ),
-                      )
-                    : Center(
-                        child: AspectRatio(
-                          aspectRatio: c.value.aspectRatio == 0
-                              ? 16 / 9
-                              : c.value.aspectRatio,
-                          child: vp.VideoPlayer(c),
-                        ),
-                      ),
-              ),
-              _VideoPlayerControls(controller: c),
-            ],
-          );
-        }
         final mk = _mkPlayer;
         final video = _mkVideo;
         if (mk == null || video == null) {
@@ -635,68 +592,8 @@ class _DrivePreviewScreenState extends State<DrivePreviewScreen> {
           ],
         );
       case DrivePreviewKind.none:
-        return const Center(child: Text('不支持预览'));
+        return Center(child: Text('不支持预览'.tr));
     }
-  }
-}
-
-class _VideoPlayerControls extends StatelessWidget {
-  const _VideoPlayerControls({required this.controller});
-  final vp.VideoPlayerController controller;
-
-  @override
-  Widget build(BuildContext context) {
-    return ValueListenableBuilder<vp.VideoPlayerValue>(
-      valueListenable: controller,
-      builder: (context, value, _) {
-        final pos = value.position;
-        final dur = value.duration;
-        return SafeArea(
-          child: Padding(
-            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-            child: Column(
-              children: [
-                vp.VideoProgressIndicator(
-                  controller,
-                  allowScrubbing: true,
-                  colors: const vp.VideoProgressColors(
-                    playedColor: Colors.white,
-                    bufferedColor: Colors.white38,
-                    backgroundColor: Colors.white24,
-                  ),
-                ),
-                Row(
-                  children: [
-                    IconButton(
-                      onPressed: () {
-                        value.isPlaying ? controller.pause() : controller.play();
-                      },
-                      icon: Icon(
-                        value.isPlaying ? Icons.pause_circle : Icons.play_circle,
-                        color: Colors.white,
-                        size: 36,
-                      ),
-                    ),
-                    Text(
-                      '${_fmt(pos)} / ${_fmt(dur)}',
-                      style: const TextStyle(color: Colors.white70),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ),
-        );
-      },
-    );
-  }
-
-  String _fmt(Duration d) {
-    final m = d.inMinutes.remainder(60).toString().padLeft(2, '0');
-    final s = d.inSeconds.remainder(60).toString().padLeft(2, '0');
-    final h = d.inHours;
-    if (h > 0) return '$h:$m:$s';
-    return '$m:$s';
   }
 }
 

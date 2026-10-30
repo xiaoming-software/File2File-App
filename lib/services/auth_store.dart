@@ -21,6 +21,9 @@ class AuthStore {
     final prefs = await SharedPreferences.getInstance();
     const secure = FlutterSecureStorage(
       aOptions: AndroidOptions(),
+      iOptions: IOSOptions(
+        accessibility: KeychainAccessibility.first_unlock_this_device,
+      ),
     );
     return AuthStore._(prefs, secure);
   }
@@ -41,24 +44,27 @@ class AuthStore {
   }
 
   Future<void> upsertAccount(SavedAccount account) async {
+    final token = account.token.trim();
     final accounts = await loadAccounts();
-    accounts.removeWhere((a) => a.token == account.token);
+    accounts.removeWhere((a) => a.token.trim() == token);
     accounts.insert(0, account);
     await _secure.write(
       key: _accountsKey,
       value: jsonEncode(accounts.map((a) => a.toJson()).toList()),
     );
-    await _prefs.setString(_lastTokenKey, account.token);
+    await _prefs.setString(_lastTokenKey, token);
   }
 
   Future<void> removeAccount(String token) async {
+    final t = token.trim();
     final accounts = await loadAccounts();
-    accounts.removeWhere((a) => a.token == token);
+    accounts.removeWhere((a) => a.token.trim() == t);
     await _secure.write(
       key: _accountsKey,
       value: jsonEncode(accounts.map((a) => a.toJson()).toList()),
     );
-    if (_prefs.getString(_lastTokenKey) == token) {
+    final last = _prefs.getString(_lastTokenKey)?.trim();
+    if (last == t) {
       await _prefs.remove(_lastTokenKey);
     }
   }
@@ -82,5 +88,10 @@ class AuthStore {
 
   Future<void> bumpQuickRegisterCount() async {
     await _prefs.setInt(_quickRegisterCountKey, quickRegisterCount() + 1);
+  }
+
+  /// Clears the local one-tap register counter (device-only preference).
+  Future<void> resetQuickRegisterCount() async {
+    await _prefs.remove(_quickRegisterCountKey);
   }
 }

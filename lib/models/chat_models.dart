@@ -1,3 +1,4 @@
+import 'package:file2file/l10n/app_l10n.dart';
 import 'dart:convert';
 
 enum ChatMsgKind { text, image, video, audio, other }
@@ -5,6 +6,8 @@ enum ChatMsgKind { text, image, video, audio, other }
 enum ChatMsgStatus {
   sending,
   sent,
+  /// Own message: peer viewport-read (requires peer caps:["read"]).
+  read,
   failed,
   receiving,
   received,
@@ -91,9 +94,12 @@ class ChatMessage {
     this.elapsedMs = 0,
     this.speedBps = 0,
     this.filePath = '',
+    this.seenByMe = true,
+    this.readReceiptPending = false,
   });
 
-  final String id;
+  /// Mutable so late type-3 can rewrite a temp id to the sender's msgId.
+  String id;
   final bool fromMe;
   ChatMsgKind kind;
   String content;
@@ -106,8 +112,21 @@ class ChatMessage {
   int speedBps;
   String filePath;
 
+  /// Peer → me: false until this bubble enters the chat viewport.
+  /// Own messages ignore this flag. Missing in old JSON ⇒ true (no badge flood).
+  bool seenByMe;
+
+  /// Seen locally but type-25 not yet delivered; flushed on reconnect.
+  bool readReceiptPending;
+
   double get progress {
-    if (size <= 0) return status == ChatMsgStatus.sent || status == ChatMsgStatus.received ? 1 : 0;
+    if (size <= 0) {
+      return status == ChatMsgStatus.sent ||
+              status == ChatMsgStatus.read ||
+              status == ChatMsgStatus.received
+          ? 1
+          : 0;
+    }
     return (transferred / size).clamp(0.0, 1.0);
   }
 
@@ -124,6 +143,8 @@ class ChatMessage {
         'elapsedMs': elapsedMs,
         'speedBps': speedBps,
         'filePath': filePath,
+        'seenByMe': seenByMe,
+        'readReceiptPending': readReceiptPending,
       };
 
   factory ChatMessage.fromJson(Map<String, dynamic> json) {
@@ -146,11 +167,12 @@ class ChatMessage {
     } else {
       time = DateTime.now();
     }
+    final fromMe = (json['from'] as String? ?? '') == 'me';
     return ChatMessage(
       id: (json['id'] as String? ?? '').isEmpty
           ? DateTime.now().microsecondsSinceEpoch.toString()
           : json['id'] as String,
-      fromMe: (json['from'] as String? ?? '') == 'me',
+      fromMe: fromMe,
       kind: kind,
       content: json['content'] as String? ?? '',
       title: json['title'] as String? ?? '',
@@ -161,6 +183,14 @@ class ChatMessage {
       elapsedMs: (json['elapsedMs'] as num?)?.toInt() ?? 0,
       speedBps: (json['speedBps'] as num?)?.toInt() ?? 0,
       filePath: json['filePath'] as String? ?? '',
+      // Legacy rows default seen (avoid unread storm after upgrade).
+      seenByMe: fromMe
+          ? true
+          : json.containsKey('seenByMe')
+              ? json['seenByMe'] == true
+              : true,
+      readReceiptPending:
+          !fromMe && json['readReceiptPending'] == true,
     );
   }
 }
@@ -188,17 +218,29 @@ class ChatSession {
   int rpcSessionId;
   final List<ChatMessage> messages;
 
+  /// Peer advertised `caps:["ack"]` in hello — enable outbox + delivery ACK.
+  bool peerCapsAck = false;
+
+  /// Peer advertised `caps:["read"]` — enable read receipts.
+  bool peerCapsRead = false;
+
+  /// Peer hello chatProto (0 = legacy / unknown).
+  int peerChatProto = 0;
+
+  int get unreadCount =>
+      messages.where((m) => !m.fromMe && !m.seenByMe).length;
+
   String get displayTitle {
     final r = remark.trim();
     if (r.isNotEmpty) return r;
     final t = peerToken.trim();
-    if (t.length <= 10) return t.isEmpty ? '未命名会话' : t;
+    if (t.length <= 10) return t.isEmpty ? '未命名会话'.tr : t;
     return '${t.substring(0, 6)}…${t.substring(t.length - 4)}';
   }
 
   String get subtitle {
-    if (connecting) return '连接中…';
-    if (connected) return '已连接 · $peerToken';
+    if (connecting) return '连接中…'.tr;
+    if (connected) return AppL10n.current.fill(r'已连接 · $peerToken', {r'$peerToken': peerToken});
     if (connectError.isNotEmpty) return connectError;
     return peerToken;
   }

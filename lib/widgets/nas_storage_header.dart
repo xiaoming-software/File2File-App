@@ -1,3 +1,4 @@
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/material.dart';
 import 'package:intl/intl.dart';
 
@@ -52,7 +53,7 @@ class NasStorageHeader extends StatelessWidget {
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
-                  '存储空间',
+                  '存储空间'.tr,
                   style: TextStyle(
                     fontSize: 16,
                     fontWeight: FontWeight.w700,
@@ -106,12 +107,12 @@ class NasStorageHeader extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(height: 16),
-                _DetailRow(label: '剩余', value: formatBytes(c.free)),
-                _DetailRow(label: '文件数', value: fileLabel),
+                _DetailRow(label: '剩余'.tr, value: formatBytes(c.free)),
+                _DetailRow(label: '文件数'.tr, value: fileLabel),
                 if (c.pct >= 80) ...[
                   const SizedBox(height: 8),
                   Text(
-                    c.pct >= 95 ? '空间将满，建议清理文件' : '空间紧张',
+                    c.pct >= 95 ? '空间将满，建议清理文件'.tr : '空间紧张'.tr,
                     style: TextStyle(
                       fontSize: 13,
                       fontWeight: FontWeight.w600,
@@ -132,13 +133,13 @@ class NasStorageHeader extends StatelessWidget {
     final c = _calc(info);
     final bar = _barColor(c.pct);
     final label =
-        '已用 ${formatBytes(c.used)}，共 ${formatBytes(c.total)}，剩余 ${formatBytes(c.free)}';
+        AppL10n.current.fill(r'已用 ${formatBytes(c.used)}，共 ${formatBytes(c.total)}，剩余 ${formatBytes(c.free)}', {r'${formatBytes(c.used)}': formatBytes(c.used), r'${formatBytes(c.total)}': formatBytes(c.total), r'${formatBytes(c.free)}': formatBytes(c.free)});
 
     return Semantics(
       button: true,
       label: label,
       child: Tooltip(
-        message: '剩余 ${formatBytes(c.free)} · 点按查看详情',
+        message: AppL10n.current.fill(r'剩余 ${formatBytes(c.free)} · 点按查看详情', {r'${formatBytes(c.free)}': formatBytes(c.free)}),
         child: Material(
           color: Colors.white.withValues(alpha: 0.92),
           borderRadius: BorderRadius.circular(12),

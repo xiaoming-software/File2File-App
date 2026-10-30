@@ -1,13 +1,15 @@
 name: file2file
 description: "File2File mobile — P2P chat and personal drive over webrpc."
 publish_to: 'none'
-version: 0.1.0+1
+version: 0.1.0+3
 
 environment:
   sdk: ^3.13.4
 
 dependencies:
   flutter:
+    sdk: flutter
+  flutter_localizations:
     sdk: flutter
   cupertino_icons: ^1.0.8
   ffi: ^2.1.4

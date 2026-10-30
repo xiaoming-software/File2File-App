@@ -1,3 +1,4 @@
+import 'package:file2file/l10n/app_l10n.dart';
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
@@ -15,8 +16,8 @@ class DriveTasksScreen extends StatelessWidget {
     final session = drive.sessionById(sessionId);
     if (session == null) {
       return Scaffold(
-        appBar: AppBar(title: const Text('传输任务')),
-        body: const Center(child: Text('会话不存在')),
+        appBar: AppBar(title: Text('传输任务'.tr)),
+        body: Center(child: Text('会话不存在'.tr)),
       );
     }
 
@@ -30,20 +31,20 @@ class DriveTasksScreen extends StatelessWidget {
 
     return Scaffold(
       appBar: AppBar(
-        title: Text(active > 0 ? '传输任务 ($active)' : '传输任务'),
+        title: Text(active > 0 ? AppL10n.current.fill(r'传输任务 ($active)', {r'$active': '$active'}) : '传输任务'.tr),
         actions: [
           TextButton(
             onPressed: session.transfers.isEmpty
                 ? null
                 : () => drive.clearFinishedTasks(session),
-            child: const Text('清除完成'),
+            child: Text('清除完成'.tr),
           ),
         ],
       ),
       body: session.transfers.isEmpty
           ? Center(
               child: Text(
-                '暂无上传/下载任务',
+                '暂无上传/下载任务'.tr,
                 style: TextStyle(color: AppTheme.ink.withValues(alpha: 0.45)),
               ),
             )
@@ -51,12 +52,12 @@ class DriveTasksScreen extends StatelessWidget {
               padding: const EdgeInsets.fromLTRB(16, 12, 16, 24),
               children: [
                 if (uploads.isNotEmpty) ...[
-                  _SectionTitle('上传 (${uploads.length})'),
+                  _SectionTitle(AppL10n.current.fill(r'上传 (${uploads.length})', {r'${uploads.length}': '${uploads.length}'})),
                   ...uploads.map((t) => _TaskCard(session: session, task: t)),
                   const SizedBox(height: 12),
                 ],
                 if (downloads.isNotEmpty) ...[
-                  _SectionTitle('下载 (${downloads.length})'),
+                  _SectionTitle(AppL10n.current.fill(r'下载 (${downloads.length})', {r'${downloads.length}': '${downloads.length}'})),
                   ...downloads.map((t) => _TaskCard(session: session, task: t)),
                 ],
               ],
@@ -99,14 +100,15 @@ class _TaskCard extends StatelessWidget {
   Widget build(BuildContext context) {
     final drive = context.read<DriveController>();
     final status = switch (task.status) {
-      DriveTransferStatus.queued => '排队中',
+      DriveTransferStatus.queued => '排队中'.tr,
       DriveTransferStatus.running =>
         '${(task.progress * 100).toStringAsFixed(0)}%'
             '${_elapsed(task)}'
             '${task.speedBps > 0 ? ' · ${formatBytes(task.speedBps)}/s' : ''}',
-      DriveTransferStatus.done => '已完成',
-      DriveTransferStatus.failed => '失败',
-      DriveTransferStatus.cancelled => '已取消',
+      DriveTransferStatus.done =>
+        task.resultNote.isNotEmpty ? task.resultNote : '已完成'.tr,
+      DriveTransferStatus.failed => '失败'.tr,
+      DriveTransferStatus.cancelled => '已取消'.tr,
     };
     final color = switch (task.status) {
       DriveTransferStatus.failed => Colors.red.shade700,
@@ -147,20 +149,20 @@ class _TaskCard extends StatelessWidget {
                 if (task.status == DriveTransferStatus.failed ||
                     task.status == DriveTransferStatus.cancelled)
                   IconButton(
-                    tooltip: '重试',
+                    tooltip: '重试'.tr,
                     onPressed: () => drive.retryTransfer(session, task),
                     icon: const Icon(Icons.refresh, size: 20),
                   ),
                 if (task.status == DriveTransferStatus.queued ||
                     task.status == DriveTransferStatus.running)
                   IconButton(
-                    tooltip: '取消',
+                    tooltip: '取消'.tr,
                     onPressed: () => drive.cancelTransfer(session, task),
                     icon: const Icon(Icons.stop_circle_outlined, size: 20),
                   )
                 else
                   IconButton(
-                    tooltip: '移除',
+                    tooltip: '移除'.tr,
                     onPressed: () => drive.removeTask(session, task),
                     icon: const Icon(Icons.close, size: 20),
                   ),
