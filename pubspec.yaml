@@ -1,7 +1,7 @@
 name: file2file
 description: "File2File mobile — P2P chat and personal drive over webrpc."
 publish_to: 'none'
-version: 0.1.0+3
+version: 1.2.1+5
 
 environment:
   sdk: ^3.13.4
